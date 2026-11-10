@@ -43,7 +43,7 @@ jobs:
           android {
               namespace = "com.example.netcheck"
               compileSdk = 34
-              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 2; versionName = "2.0" }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
           }
@@ -73,7 +73,6 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
-          import android.content.res.ColorStateList
           import android.graphics.Color
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
@@ -82,6 +81,7 @@ jobs:
           import android.text.InputType
           import android.view.Gravity
           import android.view.View
+          import android.view.ViewGroup
           import android.widget.*
           import java.io.File
           import java.net.HttpURLConnection
@@ -94,26 +94,48 @@ jobs:
 
           data class Result(val title: String, val ok: Boolean?, val detail: String, val warn: Boolean = false) // ok=null => غير متاح
           data class PingStat(val loss: Int, val minMs: Double?, val avgMs: Double?, val jitterMs: Double?)
-          data class Diag(val level: Int, val location: String, val cause: String, val fix: String) // 0 سليم، 1 تحذير، 2 عطل
           data class Hop(val ip: String, val stat: PingStat)
+          data class Diag(val level: Int, val location: String, val cause: String, val fix: String) // 0 سليم، 1 تحذير، 2 عطل
 
           private const val SEP = "\n==========\n"
+          private val cBg = Color.parseColor("#0A1426")
+          private val cCard = Color.parseColor("#14233F")
+          private val cMuted = Color.parseColor("#8FA3C7")
+          private val cText = Color.parseColor("#C7D2E8")
+          private val cMint = Color.parseColor("#34D399")
+          private val cYellow = Color.parseColor("#FACC15")
+          private val cRed = Color.parseColor("#F87171")
+          private val cOrange = Color.parseColor("#F59E0B")
 
           class MainActivity : Activity() {
-              private lateinit var out: LinearLayout
-              private lateinit var btn: Button
-              private lateinit var monBtn: Button
-              private lateinit var summary: LinearLayout
-              private lateinit var verdict: TextView
-              private lateinit var monitorView: TextView
-              private lateinit var gauge: GaugeView
-              private lateinit var graph: GraphView
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+              private val types = arrayOf("none", "ubiquiti", "mikrotik", "other")
+
+              private lateinit var pages: List<View>
+              private lateinit var tabs: List<TextView>
+              private lateinit var badge: TextView
+              private lateinit var rxVal: TextView
+              private lateinit var rxPill: TextView
+              private lateinit var rxCap: TextView
               private lateinit var txVal: TextView
-              private lateinit var txBar: ProgressBar
               private lateinit var snrVal: TextView
               private lateinit var noiseVal: TextView
-              private lateinit var linkVal: TextView
-              private lateinit var statusBadge: TextView
+              private lateinit var lossVal: TextView
+              private lateinit var graph: GraphView
+              private lateinit var dxHead: TextView
+              private lateinit var dxText: TextView
+              private lateinit var btn: Button
+              private lateinit var findBtn: Button
+              private lateinit var monBtn: Button
+              private lateinit var monitorView: TextView
+              private lateinit var detailsCard: LinearLayout
+              private lateinit var out: LinearLayout
+              private lateinit var histText: TextView
+              private lateinit var spType: Spinner
+              private lateinit var etIp: EditText
+              private lateinit var etUser: EditText
+              private lateinit var etPass: EditText
               private lateinit var cfg: DevConfig
               private var reader: DeviceReader? = null
               @Volatile private var checking = false
@@ -126,56 +148,19 @@ jobs:
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   cfg = DevConfig.load(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
-                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40); layoutDirection = View.LAYOUT_DIRECTION_RTL }
-                  val sv = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#0B1220")); addView(root) }
-                  val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
-                  val match = LinearLayout.LayoutParams.MATCH_PARENT
-                  root.addView(tv("NET CHECK", 28f, Color.WHITE, true))
-
-                  // ---- لوحة إشارة الصحن ----
-                  statusBadge = tv("غير متاح", 18f, Color.GRAY, true).apply { gravity = Gravity.CENTER }
-                  root.addView(statusBadge, LinearLayout.LayoutParams(wrap, wrap).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = px(8) })
-                  gauge = GaugeView(this)
-                  root.addView(gauge, LinearLayout.LayoutParams(wrap, wrap).apply { gravity = Gravity.CENTER_HORIZONTAL })
-
-                  txVal = tv("غير متاح", 20f, Color.WHITE, true)
-                  txBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
-                  root.addView(card().apply { addView(tv("قوة الإرسال TX", 13f, Color.GRAY)); addView(txVal); addView(txBar, LinearLayout.LayoutParams(match, wrap)) }, lp(match, wrap, top = 8))
-
-                  snrVal = tv("غير متاح", 20f, Color.WHITE, true)
-                  noiseVal = tv("غير متاح", 20f, Color.WHITE, true)
-                  root.addView(LinearLayout(this).apply {
-                      addView(tile("SNR جودة الإشارة", snrVal), lp(0, wrap, 1f, side = 4))
-                      addView(tile("Noise التشويش", noiseVal), lp(0, wrap, 1f, side = 4))
-                  }, lp(match, wrap, top = 8))
-
-                  linkVal = tv("غير متاح", 20f, Color.GRAY, true)
-                  root.addView(tile("حالة الاتصال بين الصحن والبرج", linkVal), lp(match, wrap, top = 8))
-
-                  graph = GraphView(this)
-                  root.addView(card().apply { addView(tv("حركة الإشارة خلال الوقت", 13f, Color.GRAY)); addView(graph, LinearLayout.LayoutParams(match, wrap)) }, lp(match, wrap, top = 8))
-
-                  // ---- الأزرار ----
-                  btn = Button(this).apply {
-                      text = "ابدأ الفحص"; textSize = 22f; setTextColor(Color.WHITE)
-                      background = GradientDrawable().apply { setColor(Color.parseColor("#2563EB")); cornerRadius = px(32).toFloat() }
-                      setOnClickListener { runCheck() }
+                  val home = buildHome(); val hist = buildHistory(); val set = buildSettings()
+                  val holder = FrameLayout(this).apply { addView(home); addView(hist); addView(set) }
+                  pages = listOf(home, hist, set)
+                  tabs = listOf("الرئيسية", "السجل", "الإعدادات").mapIndexed { i, n ->
+                      tv(n, 15f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, px(16), 0, px(16)); setOnClickListener { select(i) } }
                   }
-                  root.addView(btn, lp(match, px(68), top = 16))
-                  monBtn = Button(this).apply { text = "مراقبة الاستقرار"; textSize = 16f; setOnClickListener { toggleMonitor() } }
-                  root.addView(monBtn, lp(match, wrap, top = 8))
-                  root.addView(LinearLayout(this).apply {
-                      addView(small("إعدادات الجهاز") { settings() }); addView(small("السجل") { showHistory() }); addView(small("مشاركة التقرير") { share() })
-                  })
-                  summary = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 24, 0, 0) }
-                  root.addView(summary)
-                  verdict = tv("", 18f, Color.YELLOW, true).apply { setPadding(0, 16, 0, 8) }
-                  root.addView(verdict)
-                  monitorView = tv("", 15f, Color.CYAN)
-                  root.addView(monitorView)
-                  out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                  root.addView(out)
-                  setContentView(sv)
+                  val nav = LinearLayout(this).apply { background = bg(cCard, 0); tabs.forEach { addView(it, LinearLayout.LayoutParams(0, WRAP, 1f)) } }
+                  val rootV = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg); layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      addView(holder, LinearLayout.LayoutParams(MATCH, 0, 1f)); addView(nav, LinearLayout.LayoutParams(MATCH, WRAP))
+                  }
+                  select(0)
+                  setContentView(rootV)
               }
 
               // توفير البطارية: تتوقف المراقبة عند خروج التطبيق من الشاشة
@@ -183,7 +168,247 @@ jobs:
 
               override fun onDestroy() { monitoring = false; super.onDestroy() }
 
+              // ---------- أدوات الواجهة ----------
               private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+              private fun bg(color: Int, r: Int, stroke: Int = 0, sc: Int = 0) = GradientDrawable().apply {
+                  setColor(color); cornerRadius = px(r).toFloat(); if (stroke > 0) setStroke(px(stroke), sc)
+              }
+              private fun tv(t: String, size: Float, c: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(c); gravity = Gravity.START
+                  if (bold) setTypeface(null, Typeface.BOLD)
+              }
+              private fun card(): LinearLayout = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(16)); background = bg(cCard, 22)
+              }
+              private fun lp(w: Int, h: Int, weight: Float = 0f, top: Int = 0, side: Int = 0) =
+                  LinearLayout.LayoutParams(w, h, weight).apply { setMargins(px(side), px(top), px(side), 0) }
+              private fun setPill(v: TextView, t: String, c: Int) {
+                  v.text = t; v.setTextColor(c); v.background = bg(Color.argb(46, Color.red(c), Color.green(c), Color.blue(c)), 20)
+              }
+              private fun pill(t: String, c: Int) = TextView(this).apply { textSize = 14f; setPadding(px(14), px(5), px(14), px(5)); setPill(this, t, c) }
+              private fun tile(title: String, v: TextView): LinearLayout = card().apply { addView(tv(title, 14f, cMuted)); addView(v) }
+              private fun outline(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; textSize = 15f; isAllCaps = false; setTextColor(Color.WHITE); background = bg(Color.TRANSPARENT, 18, 1, cMuted)
+                  setOnClickListener { f() }
+              }
+              private fun colorOf(ok: Boolean?, warn: Boolean) = when { ok == null -> cMuted; !ok -> cRed; warn -> cYellow; else -> cMint }
+
+              private fun select(i: Int) {
+                  pages.forEachIndexed { k, p -> p.visibility = if (k == i) View.VISIBLE else View.GONE }
+                  tabs.forEachIndexed { k, t -> t.setTextColor(if (k == i) Color.WHITE else cMuted); t.setTypeface(null, if (k == i) Typeface.BOLD else Typeface.NORMAL) }
+                  if (i == 1) refreshHistory()
+              }
+
+              // ---------- الصفحة الرئيسية ----------
+              private fun buildHome(): ScrollView {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  head.addView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(tv("NET CHECK", 34f, Color.WHITE, true)); addView(tv("فاحص إشارة الإنترنت اللاسلكي", 14f, cMuted))
+                  }, lp(0, WRAP, 1f))
+                  badge = pill("غير مفحوص", cMuted)
+                  head.addView(badge)
+                  col.addView(head)
+
+                  rxVal = tv("--", 52f, cMuted, true).apply { gravity = Gravity.CENTER }
+                  rxPill = pill("غير متاح", cMuted)
+                  rxCap = tv("غير متاح: ابحث عن الصحن أو أضفه من الإعدادات", 13f, cMuted).apply { gravity = Gravity.CENTER }
+                  col.addView(card().apply {
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      addView(tv("قوة إشارة الاستقبال RX", 18f, Color.WHITE).apply { gravity = Gravity.CENTER })
+                      addView(rxVal, lp(MATCH, WRAP, top = 10))
+                      addView(rxPill, LinearLayout.LayoutParams(WRAP, WRAP).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = px(6) })
+                      addView(rxCap, lp(MATCH, WRAP, top = 12))
+                  }, lp(MATCH, WRAP, top = 16))
+
+                  txVal = tv("--", 30f, Color.WHITE, true); snrVal = tv("--", 30f, Color.WHITE, true)
+                  noiseVal = tv("--", 30f, Color.WHITE, true); lossVal = tv("--", 30f, Color.WHITE, true)
+                  col.addView(LinearLayout(this).apply {
+                      addView(tile("الإرسال TX", txVal), lp(0, WRAP, 1f, side = 5)); addView(tile("جودة الإشارة SNR", snrVal), lp(0, WRAP, 1f, side = 5))
+                  }, lp(MATCH, WRAP, top = 12))
+                  col.addView(LinearLayout(this).apply {
+                      addView(tile("التشويش Noise", noiseVal), lp(0, WRAP, 1f, side = 5)); addView(tile("فقدان الحزم", lossVal), lp(0, WRAP, 1f, side = 5))
+                  }, lp(MATCH, WRAP, top = 12))
+
+                  graph = GraphView(this)
+                  col.addView(card().apply {
+                      addView(tv("استقرار الإشارة", 20f, Color.WHITE, true))
+                      addView(graph, lp(MATCH, WRAP, top = 8))
+                      addView(tv("متابعة تغير الإشارة مع الوقت", 13f, cMuted).apply { setPadding(0, px(6), 0, 0) })
+                  }, lp(MATCH, WRAP, top = 12))
+
+                  dxHead = tv("لم يتم الفحص بعد", 22f, cMuted, true).apply { setPadding(0, px(10), 0, px(4)) }
+                  dxText = tv("اضغط «ابدأ الفحص» لتشخيص الاتصال", 14f, cMuted)
+                  col.addView(card().apply { addView(tv("التشخيص", 20f, Color.WHITE, true)); addView(dxHead); addView(dxText) }, lp(MATCH, WRAP, top = 12))
+
+                  btn = Button(this).apply {
+                      text = "ابدأ الفحص"; textSize = 22f; isAllCaps = false; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE)
+                      background = bg(cOrange, 24); setOnClickListener { runCheck() }
+                  }
+                  col.addView(btn, lp(MATCH, px(66), top = 16))
+                  findBtn = outline("بحث عن الصحن") { findDish() }
+                  monBtn = outline("مراقبة الاستقرار") { toggleMonitor() }
+                  col.addView(LinearLayout(this).apply { addView(findBtn, lp(0, px(52), 1f, side = 5)); addView(monBtn, lp(0, px(52), 1f, side = 5)) }, lp(MATCH, WRAP, top = 10))
+                  monitorView = tv("", 14f, Color.CYAN)
+                  col.addView(monitorView, lp(MATCH, WRAP, top = 8))
+
+                  out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  detailsCard = card().apply { visibility = View.GONE; addView(tv("تفاصيل الفحص", 20f, Color.WHITE, true)); addView(out) }
+                  col.addView(detailsCard, lp(MATCH, WRAP, top = 12))
+                  return ScrollView(this).apply { addView(col) }
+              }
+
+              /** لوحة الصحن: كل قيمة تُعرض فقط إذا وفّرها الجهاز فعلاً، وإلا -- */
+              private fun updateDash(d: DevData?, est: Pair<String, Int>? = null) {
+                  val sig = d?.signal
+                  val dead = d != null && (!d.reachable || d.linked == false)
+                  val (st, sc) = when {
+                      d == null -> est ?: ("غير متاح" to cMuted)
+                      dead -> "منقطع" to cRed
+                      sig == null -> est ?: ("غير متاح" to cMuted)
+                      sig >= -60 -> "ممتازة" to cMint
+                      sig >= -70 -> "جيدة جداً" to cMint
+                      sig >= -80 -> "ضعيفة" to cYellow
+                      else -> "ضعيفة جداً" to cRed
+                  }
+                  val real = sig != null && !dead
+                  rxVal.text = if (real) "$sig dBm" else "--"
+                  rxVal.setTextColor(if (real) sc else cMuted)
+                  setPill(rxPill, st, sc)
+                  rxCap.text = when {
+                      d == null -> "غير متاح: ابحث عن الصحن أو أضفه من الإعدادات"
+                      !d.reachable -> "الصحن لا يستجيب على الشبكة"
+                      d.linked == false -> "منقطع عن البرج"
+                      sig == null -> (d.error ?: "غير متاح: الجهاز لا يوفّر قراءة الإشارة") + (est?.let { " — تقدير غير مباشر لرابط الصحن: ${it.first}" } ?: "")
+                      else -> (if (d.linked == true) "مرتبط بالبرج · " else "") + "قراءة حقيقية من جهاز الصحن"
+                  }
+                  txVal.text = d?.txPower?.let { "$it dBm" } ?: "--"
+                  snrVal.text = d?.snr?.let { "$it dB" } ?: "--"
+                  noiseVal.text = d?.noise?.let { "$it dBm" } ?: "--"
+                  if (sig != null && !dead) graph.add(sig)
+              }
+
+              // ---------- السجل ----------
+              private fun buildHistory(): ScrollView {
+                  histText = tv("", 14f, cText)
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  col.addView(tv("السجل", 30f, Color.WHITE, true))
+                  col.addView(card().apply { addView(histText) }, lp(MATCH, WRAP, top = 12))
+                  col.addView(outline("مشاركة آخر تقرير") { share() }, lp(MATCH, px(52), top = 12))
+                  col.addView(outline("مسح السجل") { histFile.delete(); refreshHistory() }, lp(MATCH, px(52), top = 8))
+                  return ScrollView(this).apply { addView(col) }
+              }
+              private fun refreshHistory() { val t = if (histFile.exists()) histFile.readText() else ""; histText.text = if (t.isBlank()) "لا يوجد سجل بعد" else t }
+
+              private fun share() {
+                  val rep = if (lastReport.isNotBlank()) lastReport else (if (histFile.exists()) histFile.readText().split(SEP).firstOrNull() ?: "" else "")
+                  if (rep.isBlank()) { toast("أجرِ فحصاً أولاً"); return }
+                  startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, rep) }, "مشاركة التقرير"))
+              }
+
+              private fun saveHistory(rep: String) {
+                  try {
+                      val old = (if (histFile.exists()) histFile.readText() else "").split(SEP).filter { it.isNotBlank() }
+                      histFile.writeText((listOf(rep) + old).take(30).joinToString(SEP)) // الأحدث أولاً
+                  } catch (e: Exception) { }
+              }
+
+              // ---------- الإعدادات ----------
+              private fun edit(h: String, pw: Boolean = false) = EditText(this).apply {
+                  hint = h; setTextColor(Color.WHITE); setHintTextColor(cMuted)
+                  inputType = if (pw) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_CLASS_TEXT
+              }
+              private fun field(label: String, v: View): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(tv(label, 13f, cMuted)); addView(v) }
+
+              private fun buildSettings(): ScrollView {
+                  spType = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, arrayOf("بدون جهاز", "Ubiquiti (airOS)", "MikroTik (RouterOS 7)", "أخرى / TP-Link (فحص الوصول فقط)"))
+                  }
+                  etIp = edit("192.168.1.20"); etUser = edit("اسم المستخدم"); etPass = edit("كلمة المرور", true)
+                  fillSettings()
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  col.addView(tv("الإعدادات", 30f, Color.WHITE, true))
+                  col.addView(card().apply {
+                      addView(tv("جهاز الصحن", 18f, Color.WHITE, true))
+                      addView(field("النوع", spType), lp(MATCH, WRAP, top = 10)); addView(field("عنوان IP", etIp), lp(MATCH, WRAP, top = 10))
+                      addView(field("اسم المستخدم", etUser), lp(MATCH, WRAP, top = 10)); addView(field("كلمة المرور", etPass), lp(MATCH, WRAP, top = 10))
+                  }, lp(MATCH, WRAP, top = 12))
+                  col.addView(Button(this).apply {
+                      text = "حفظ"; textSize = 20f; isAllCaps = false; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE)
+                      background = bg(cOrange, 24); setOnClickListener { saveSettings() }
+                  }, lp(MATCH, px(58), top = 16))
+                  col.addView(outline("بحث عن الصحن") { findDish() }, lp(MATCH, px(52), top = 10))
+                  col.addView(outline("إعادة البحث التلقائي") { getSharedPreferences("auto", 0).edit().clear().apply(); toast("تم مسح العنوان المحفوظ") }, lp(MATCH, px(52), top = 8))
+                  col.addView(tv("كلمة مرور الجهاز تُحفظ مشفّرة على هاتفك فقط.", 12f, cMuted), lp(MATCH, WRAP, top = 12))
+                  col.addView(tv("الإصدار 2.0 (الواجهة الجديدة)", 12f, cMuted), lp(MATCH, WRAP, top = 6))
+                  return ScrollView(this).apply { addView(col) }
+              }
+              private fun fillSettings() { spType.setSelection(types.indexOf(cfg.type).coerceAtLeast(0)); etIp.setText(cfg.ip); etUser.setText(cfg.user); etPass.setText(cfg.pass) }
+              private fun saveSettings() {
+                  cfg = DevConfig(types[spType.selectedItemPosition], etIp.text.toString().trim(), etUser.text.toString().trim(), etPass.text.toString())
+                  cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
+                  toast("تم الحفظ")
+              }
+
+              // ---------- زر: بحث عن الصحن ----------
+              private fun ipStr(x: Int) = "${x and 255}.${x shr 8 and 255}.${x shr 16 and 255}.${x shr 24 and 255}"
+              private fun kindName(k: String) = when (k) { "ubiquiti" -> "Ubiquiti"; "mikrotik" -> "MikroTik"; else -> "TP-Link / غير معروف" }
+
+              private fun findDish() {
+                  val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  @Suppress("DEPRECATION") val dh = wm.dhcpInfo
+                  val gw = dh?.gateway ?: 0
+                  if (gw == 0) { toast("اتصل بشبكة Wi-Fi الخاصة بالراوتر أولاً"); return }
+                  val gwIp = ipStr(gw); val me = ipStr(dh?.ipAddress ?: 0)
+                  val wait = AlertDialog.Builder(this).setTitle("بحث عن الصحن").setMessage("جاري البحث في شبكة الراوتر $gwIp ...").setCancelable(false).show()
+                  thread {
+                      val found = try { Scanner.findAll(gwIp, me) } catch (e: Exception) { emptyList() }
+                      runOnUiThread { wait.dismiss(); onFound(found) }
+                  }
+              }
+
+              private fun onFound(list: List<Found>) {
+                  if (list.isEmpty()) {
+                      AlertDialog.Builder(this).setTitle("لم يُعثر على الصحن")
+                          .setMessage("لم يُكتشف جهاز صحن في شبكة الراوتر تلقائياً (قد يكون على نطاق IP مختلف). أضف عنوانه يدوياً من «الإعدادات».")
+                          .setPositiveButton("فتح الإعدادات") { _, _ -> select(2) }.setNegativeButton("إغلاق", null).show()
+                      return
+                  }
+                  if (list.size == 1) askCreds(list[0])
+                  else AlertDialog.Builder(this).setTitle("اختر الصحن")
+                      .setItems(list.map { "${it.ip}  (${kindName(it.kind)})" }.toTypedArray()) { _, i -> askCreds(list[i]) }.show()
+              }
+
+              private fun askCreds(f: Found) {
+                  if (f.kind == "other") {
+                      cfg = DevConfig("other", f.ip, "", ""); cfg.save(this); reader = DeviceReader(cfg); fillSettings()
+                      AlertDialog.Builder(this).setTitle("تم العثور على جهاز")
+                          .setMessage("عُثر على جهاز في ${f.ip} لكن نوعه غير مدعوم لقراءة الإشارة، وسيُفحص وصوله فقط.").setPositiveButton("حسناً", null).show()
+                      return
+                  }
+                  val us = edit("اسم المستخدم"); val pw = edit("كلمة المرور", true)
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(20), px(8), px(20), 0); addView(us); addView(pw) }
+                  AlertDialog.Builder(this).setTitle("تم العثور على الصحن")
+                      .setMessage("${f.ip} (${kindName(f.kind)})\nأدخل اسم المستخدم وكلمة المرور الخاصة بجهازك ليقرأ التطبيق قوة الإشارة.").setView(box)
+                      .setPositiveButton("حفظ وقراءة") { _, _ ->
+                          cfg = DevConfig(f.kind, f.ip, us.text.toString().trim(), pw.text.toString())
+                          cfg.save(this); reader = DeviceReader(cfg); fillSettings(); readNow()
+                      }.setNegativeButton("إلغاء", null).show()
+              }
+
+              private fun readNow() {
+                  thread {
+                      val d = try { (reader ?: DeviceReader(cfg).also { reader = it }).read() } catch (e: Exception) { null }
+                      runOnUiThread {
+                          updateDash(d)
+                          if (d == null) toast("تعذّرت القراءة")
+                          else if (d.error != null) toast(d.error)
+                          else if (d.signal == null) toast("الجهاز لم يوفّر قراءة الإشارة")
+                      }
+                  }
+              }
 
               /** يستعمل عنوان الصحن المحفوظ لنفس الراوتر، وإلا يبحث عنه في شبكة الراوتر ثم يحفظه */
               private fun autoDish(gwIp: String, meInt: Int): DevConfig? {
@@ -195,91 +420,6 @@ jobs:
                   p.edit().putString("gw", gwIp).putString("ip", found).apply()
                   return DevConfig("other", found, "", "")
               }
-              private fun card(): LinearLayout = LinearLayout(this).apply {
-                  orientation = LinearLayout.VERTICAL; setPadding(px(14), px(12), px(14), px(12))
-                  background = GradientDrawable().apply { setColor(Color.parseColor("#111A2E")); cornerRadius = px(16).toFloat() }
-              }
-              private fun tile(title: String, v: TextView): LinearLayout = card().apply { addView(tv(title, 13f, Color.GRAY)); addView(v) }
-              private fun lp(w: Int, h: Int, weight: Float = 0f, top: Int = 0, side: Int = 0) =
-                  LinearLayout.LayoutParams(w, h, weight).apply { setMargins(px(side), px(top), px(side), 0) }
-
-              /** تحديث لوحة الصحن: كل قيمة تُعرض فقط إذا وفّرها الجهاز، وإلا "غير متاح" */
-              private fun updateDash(d: DevData?, est: Pair<String, Int>? = null) {
-                  val sig = d?.signal
-                  val dead = d != null && (!d.reachable || d.linked == false)
-                  val (st, sc) = when {
-                      d == null -> est ?: ("غير متاح" to Color.GRAY)
-                      dead -> "منقطع" to Color.RED
-                      sig == null -> est ?: ("غير متاح" to Color.GRAY)
-                      sig >= -60 -> "ممتاز" to Color.GREEN
-                      sig >= -70 -> "جيد" to Color.parseColor("#84CC16")
-                      sig >= -80 -> "ضعيف" to Color.YELLOW
-                      else -> "ضعيف" to Color.RED
-                  }
-                  statusBadge.text = st; statusBadge.setTextColor(sc)
-                  gauge.value = if (dead) null else sig
-                  txVal.text = d?.txPower?.let { "$it dBm" } ?: "غير متاح"
-                  txBar.progress = (d?.txPower ?: 0).coerceIn(0, 30) * 100 / 30
-                  txBar.progressTintList = ColorStateList.valueOf(Color.parseColor("#38BDF8"))
-                  snrVal.text = d?.snr?.let { "$it dB" } ?: "غير متاح"
-                  noiseVal.text = d?.noise?.let { "$it dBm" } ?: "غير متاح"
-                  val (lt, lc) = when {
-                      d == null -> "غير متاح" to Color.GRAY
-                      !d.reachable -> "الصحن لا يستجيب" to Color.RED
-                      d.linked == true -> "مرتبط بالبرج" to Color.GREEN
-                      d.linked == false -> "منقطع عن البرج" to Color.RED
-                      else -> "غير متاح: الجهاز لا يوفّر الحالة" to Color.GRAY
-                  }
-                  linkVal.text = lt; linkVal.setTextColor(lc)
-                  if (sig != null && !dead) graph.add(sig)
-              }
-
-              private fun tv(t: String, size: Float, c: Int, bold: Boolean = false) = TextView(this).apply {
-                  text = t; textSize = size; setTextColor(c); gravity = Gravity.START
-                  if (bold) setTypeface(null, Typeface.BOLD)
-              }
-              private fun small(t: String, f: () -> Unit) = Button(this).apply {
-                  text = t; textSize = 13f; setOnClickListener { f() }
-                  layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-              }
-              private fun colorOf(ok: Boolean?, warn: Boolean) = when { ok == null -> Color.GRAY; !ok -> Color.RED; warn -> Color.YELLOW; else -> Color.GREEN }
-              private fun sumRow(t: String, c: Int) { summary.addView(tv(t, 20f, c, true).apply { setPadding(0, 6, 0, 6) }) }
-
-              // ---------- إعدادات الجهاز / السجل / المشاركة ----------
-              private fun settings() {
-                  val types = arrayOf("none", "ubiquiti", "mikrotik", "other")
-                  val names = arrayOf("بدون جهاز", "Ubiquiti (airOS)", "MikroTik (RouterOS 7)", "أخرى / TP-Link (فحص الوصول فقط)")
-                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 0); layoutDirection = View.LAYOUT_DIRECTION_RTL }
-                  val sp = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names); setSelection(types.indexOf(cfg.type).coerceAtLeast(0)) }
-                  val ip = EditText(this).apply { hint = "IP الجهاز مثل 192.168.1.20"; setText(cfg.ip) }
-                  val us = EditText(this).apply { hint = "اسم المستخدم"; setText(cfg.user) }
-                  val pw = EditText(this).apply { hint = "كلمة المرور"; setText(cfg.pass); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
-                  listOf(sp, ip, us, pw).forEach { box.addView(it) }
-                  AlertDialog.Builder(this).setTitle("إعدادات جهاز الصحن").setView(box)
-                      .setPositiveButton("حفظ") { _, _ ->
-                          cfg = DevConfig(types[sp.selectedItemPosition], ip.text.toString().trim(), us.text.toString().trim(), pw.text.toString())
-                          cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
-                      }.setNegativeButton("إلغاء", null).setNeutralButton("إعادة البحث التلقائي") { _, _ -> getSharedPreferences("auto", 0).edit().clear().apply() }.show()
-              }
-
-              private fun showHistory() {
-                  val t = if (histFile.exists()) histFile.readText() else ""
-                  AlertDialog.Builder(this).setTitle("سجل الفحوصات").setMessage(if (t.isBlank()) "لا يوجد سجل بعد" else t)
-                      .setPositiveButton("إغلاق", null).setNeutralButton("مسح السجل") { _, _ -> histFile.delete() }.show()
-              }
-
-              private fun share() {
-                  if (lastReport.isBlank()) { Toast.makeText(this, "أجرِ فحصاً أولاً", Toast.LENGTH_SHORT).show(); return }
-                  startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, lastReport) }, "مشاركة التقرير"))
-              }
-
-              private fun saveHistory(rep: String) {
-                  try {
-                      val old = (if (histFile.exists()) histFile.readText() else "").split(SEP).filter { it.isNotBlank() }
-                      histFile.writeText((listOf(rep) + old).take(30).joinToString(SEP)) // الأحدث أولاً
-                  } catch (e: Exception) { }
-              }
-
               // ---------- المرحلة 3: الصحن والكيبل ----------
               private fun fmtUp(s: Long) = "${s / 86400}d ${s % 86400 / 3600}h ${s % 3600 / 60}m"
 
@@ -351,7 +491,7 @@ jobs:
               private fun runCheck() {
                   if (checking) return
                   checking = true
-                  btn.isEnabled = false; out.removeAllViews(); summary.removeAllViews(); verdict.text = "جاري الفحص..."; verdict.setTextColor(Color.YELLOW)
+                  btn.isEnabled = false; out.removeAllViews(); dxHead.text = "جاري الفحص..."; dxHead.setTextColor(cYellow); dxText.text = "قد يستغرق الفحص نصف دقيقة"; dxText.setTextColor(cMuted)
                   thread { try {
                       val r = mutableListOf<Result>()
                       val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -407,22 +547,20 @@ jobs:
                       lastReport = rep; saveHistory(rep)
                       runOnUiThread {
                           updateDash(d, est)
-                          summary.removeAllViews()
-                          sumRow("الإنترنت: " + (if (netUp) "يعمل" else "منقطع"), colorOf(netUp, false))
-                          sumRow("الراوتر: " + (if (routerOk) "متصل ($gwIp)" else "غير متصل"), colorOf(routerOk, false))
-                          d?.signal?.let { s -> val x = r[0]; sumRow("إشارة الصحن: $s dBm", colorOf(x.ok, x.warn)) }
-                          sumRow("سرعة الاستجابة: " + (if (netUp) "%.0f ms".format(best.avgMs ?: 0.0) else "-"), colorOf(pingR.ok, pingR.warn))
-                          sumRow("نسبة فقدان الحزم: " + (if (netUp) "${best.loss}%" else "-"), colorOf(lossR.ok, lossR.warn))
-                          verdict.text = "مكان العطل: ${dg.location}\nالسبب: ${dg.cause}\nالحل المقترح: ${dg.fix}"
-                          verdict.setTextColor(when (dg.level) { 0 -> Color.GREEN; 1 -> Color.YELLOW; else -> Color.RED })
+                          lossVal.text = if (netUp) "${best.loss}%" else "--"
+                          setPill(badge, if (netUp) "متصل" else "منقطع", if (netUp) cMint else cRed)
+                          dxHead.text = dg.location
+                          dxHead.setTextColor(when (dg.level) { 0 -> cMint; 1 -> cYellow; else -> cRed })
+                          dxText.text = "السبب: ${dg.cause}\nالحل المقترح: ${dg.fix}"; dxText.setTextColor(cText)
+                          detailsCard.visibility = View.VISIBLE
                           r.forEach { x ->
-                              out.addView(tv(x.title, 17f, colorOf(x.ok, x.warn), true).apply { setPadding(0, 24, 0, 0) })
-                              out.addView(tv(x.detail, 15f, Color.LTGRAY))
+                              out.addView(tv(x.title, 16f, colorOf(x.ok, x.warn), true).apply { setPadding(0, px(12), 0, 0) })
+                              out.addView(tv(x.detail, 14f, cText))
                           }
                           btn.isEnabled = true; btn.text = "إعادة الفحص"
                       }
                   } catch (e: Exception) {
-                      runOnUiThread { verdict.text = "تعذّر إكمال الفحص: ${e.message}"; verdict.setTextColor(Color.RED); btn.isEnabled = true }
+                      runOnUiThread { dxHead.text = "تعذّر إكمال الفحص"; dxHead.setTextColor(cRed); dxText.text = e.message ?: ""; btn.isEnabled = true }
                   } finally { checking = false }
                   }
               }
@@ -592,229 +730,6 @@ jobs:
 
           private fun num(s: String?) = s?.let { Regex("-?\\d+").find(it)?.value?.toIntOrNull() }
 
-          /** اكتشاف تلقائي لجهاز الصحن داخل شبكة الراوتر بدون كلمة مرور: يتعرف عليه من صفحة الدخول أو منفذ Winbox */
-          object Scanner {
-              private val sigs = listOf("airos", "ubiquiti", "ubnt", "airmax", "routeros", "mikrotik", "tp-link", "tplink", "nanostation", "litebeam", "powerbeam", "nanobeam")
-
-              private fun portOpen(h: String, port: Int, ms: Int) = try { Socket().use { it.connect(InetSocketAddress(h, port), ms); true } } catch (e: Exception) { false }
-
-              private fun isDish(h: String): Boolean {
-                  if (portOpen(h, 8291, 300)) return true
-                  if (!portOpen(h, 80, 400)) return false
-                  return try {
-                      val c = URL("http://$h/").openConnection() as HttpURLConnection
-                      c.connectTimeout = 1000; c.readTimeout = 1500
-                      val code = c.responseCode
-                      val head = c.headerFields.entries.joinToString(" ") { (it.key ?: "") + " " + it.value.joinToString(" ") }
-                      val body = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { r -> val b = CharArray(4000); val n = r.read(b); if (n > 0) String(b, 0, n) else "" } ?: ""
-                      val t = (head + " " + body).lowercase()
-                      sigs.any { t.contains(it) }
-                  } catch (e: Exception) { false }
-              }
-
-              fun find(gw: String, me: String?): String? {
-                  val base = gw.substringBeforeLast(".") + "."
-                  val found = java.util.concurrent.ConcurrentLinkedQueue<String>()
-                  val pool = java.util.concurrent.Executors.newFixedThreadPool(48)
-                  for (i in 1..254) { val h = base + i; if (h != gw && h != me) pool.execute { if (isDish(h)) found.add(h) } }
-                  pool.shutdown()
-                  pool.awaitTermination(25, java.util.concurrent.TimeUnit.SECONDS)
-                  return found.sortedBy { it.substringAfterLast(".").toInt() }.firstOrNull()
-              }
-          }
-
-          class DeviceReader(private val cfg: DevConfig) {
-              private val cookies = mutableMapOf<String, String>()
-
-              private fun open(ip: String, port: Int) = try { Socket().use { it.connect(InetSocketAddress(ip, port), 1500); true } } catch (e: Exception) { false }
-
-              private fun http(url: String, method: String = "GET", body: ByteArray? = null, ctype: String? = null, auth: String? = null): Pair<Int, String> {
-                  val c = URL(url).openConnection() as HttpURLConnection
-                  if (c is HttpsURLConnection) { // الأجهزة المحلية بشهادات ذاتية؛ يُطبَّق فقط على IP الجهاز الذي أدخله المستخدم
-                      val tm = arrayOf<TrustManager>(object : X509TrustManager {
-                          override fun checkClientTrusted(a: Array<X509Certificate>?, t: String?) {}
-                          override fun checkServerTrusted(a: Array<X509Certificate>?, t: String?) {}
-                          override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
-                      })
-                      val ctx = SSLContext.getInstance("TLS"); ctx.init(null, tm, null)
-                      c.sslSocketFactory = ctx.socketFactory; c.hostnameVerifier = HostnameVerifier { _, _ -> true }
-                  }
-                  c.requestMethod = method; c.connectTimeout = 4000; c.readTimeout = 6000; c.instanceFollowRedirects = false
-                  if (cookies.isNotEmpty()) c.setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
-                  if (auth != null) c.setRequestProperty("Authorization", auth)
-                  if (ctype != null) c.setRequestProperty("Content-Type", ctype)
-                  if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body) } }
-                  val code = c.responseCode
-                  c.headerFields["Set-Cookie"]?.forEach { sc -> val kv = sc.substringBefore(";"); if (kv.contains("=")) cookies[kv.substringBefore("=").trim()] = kv.substringAfter("=").trim() }
-                  val txt = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
-                  return code to txt
-              }
-
-              @Synchronized fun read(): DevData {
-                  val ip = cfg.ip
-                  val https = open(ip, 443); val plain = open(ip, 80)
-                  if (!https && !plain) return DevData(false, cfg.type == "ubiquiti" || cfg.type == "mikrotik")
-                  if (cfg.type == "other") return DevData(true, false, "غير متاح: قراءة الإشارة تتطلب بيانات دخول الصحن (إعدادات الجهاز)؛ يُفحص وصول الجهاز فقط")
-                  val base = (if (https) "https://" else "http://") + ip
-                  return try { if (cfg.type == "ubiquiti") ubnt(base) else mt(base) } catch (e: Exception) { DevData(true, true, "تعذّرت القراءة: ${e.message}") }
-              }
-
-              private fun ubnt(b: String): DevData {
-                  cookies.clear()
-                  http("$b/login.cgi")
-                  val bd = "----netcheck"
-                  fun part(n: String, v: String) = "--$bd\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n"
-                  val form = part("username", cfg.user) + part("password", cfg.pass) + part("uri", "/status.cgi") + "--$bd--\r\n"
-                  http("$b/login.cgi", "POST", form.toByteArray(), "multipart/form-data; boundary=$bd")
-                  var txt = http("$b/status.cgi").second
-                  if (!txt.trimStart().startsWith("{")) { // airOS الأحدث
-                      http("$b/api/auth", "POST", JSONObject().put("username", cfg.user).put("password", cfg.pass).toString().toByteArray(), "application/json")
-                      txt = http("$b/status.cgi").second
-                  }
-                  if (!txt.trimStart().startsWith("{")) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور ونوع الجهاز")
-                  val j = JSONObject(txt); val w = j.optJSONObject("wireless"); val h = j.optJSONObject("host")
-                  val sig = w?.optInt("signal", 0)?.takeIf { it != 0 }
-                  val noise = w?.optInt("noisef", 0)?.takeIf { it != 0 }
-                  val tx = w?.optInt("txpower", 0)?.takeIf { it != 0 }
-                  val linked: Boolean? = if (w != null && w.optString("opmode") == "sta") sig != null else null
-                  var ethUp: Boolean? = null; var spd: Int? = null
-                  val arr = j.optJSONArray("interfaces")
-                  if (arr != null) for (i in 0 until arr.length()) {
-                      val o = arr.optJSONObject(i) ?: continue
-                      val st = o.optJSONObject("status")
-                      if (o.optString("ifname") == "eth0" && st != null) { ethUp = st.optInt("plugged", 0) == 1; spd = st.optInt("speed", 0).takeIf { it > 0 } }
-                  }
-                  val up = h?.optLong("uptime", -1)?.takeIf { it >= 0 }
-                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null, tx)
-              }
-
-              private fun mt(b: String): DevData {
-                  val auth = "Basic " + Base64.encodeToString("${cfg.user}:${cfg.pass}".toByteArray(), Base64.NO_WRAP)
-                  fun get(path: String) = http("$b/rest/$path", auth = auth)
-                  val probe = get("system/resource")
-                  if (probe.first == 401) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور")
-                  if (probe.first != 200) return DevData(true, true, "REST API غير متاح (يتطلب RouterOS 7.1+ مع تفعيل خدمة www)")
-                  var reg = get("interface/wifi/registration-table")
-                  if (reg.first != 200) reg = get("interface/wireless/registration-table")
-                  var linked: Boolean? = null; var sig: Int? = null; var snr: Int? = null; var noise: Int? = null
-                  if (reg.first == 200) {
-                      val a = JSONArray(reg.second); linked = a.length() > 0
-                      if (a.length() > 0) {
-                          val o = a.getJSONObject(0)
-                          sig = num(o.optString("signal").ifEmpty { o.optString("signal-strength") })
-                          snr = num(o.optString("signal-to-noise")); noise = num(o.optString("noise-floor"))
-                          if (snr == null && sig != null && noise != null) snr = sig - noise
-                          if (noise == null && sig != null && snr != null) noise = sig - snr
-                      }
-                  }
-                  var ethUp: Boolean? = null; var spd: Int? = null
-                  val eth = get("interface/ethernet")
-                  if (eth.first == 200) {
-                      val a = JSONArray(eth.second)
-                      if (a.length() > 0) {
-                          val o = a.getJSONObject(0); ethUp = o.optString("running") == "true"
-                          val rate = o.optString("rate")
-                          spd = when { rate.contains("10Gbps") -> 10000; rate.contains("2.5Gbps") -> 2500; rate.contains("1Gbps") -> 1000; rate.contains("100Mbps") -> 100; rate.contains("10Mbps") -> 10; else -> null }
-                      }
-                  }
-                  var v: Double? = null
-                  val hl = get("system/health")
-                  if (hl.first == 200) {
-                      val t = hl.second.trim()
-                      if (t.startsWith("[")) { val a = JSONArray(t); for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("name") == "voltage") v = o.optString("value").toDoubleOrNull() } }
-                      else v = JSONObject(t).optString("voltage").toDoubleOrNull()
-                  }
-                  var tx: Int? = null
-                  try {
-                      val wl = get("interface/wireless")
-                      if (wl.first == 200) { val a = JSONArray(wl.second); if (a.length() > 0) tx = num(a.getJSONObject(0).optString("tx-power"))?.takeIf { it in 1..40 } }
-                  } catch (e: Exception) { }
-                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v, tx)
-              }
-          }
-          NETCHECK_EOF
-          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/UiViews.kt')"
-          cat > 'app/src/main/java/com/example/netcheck/UiViews.kt' <<'NETCHECK_EOF'
-          package com.example.netcheck
-
-          import android.content.Context
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.Paint
-          import android.graphics.Path
-          import android.graphics.RectF
-          import android.graphics.Typeface
-          import android.view.View
-
-          /** مؤشر دائري كبير لقوة استقبال الصحن RX بوحدة dBm (المدى من -90 إلى -40) */
-          class GaugeView(c: Context) : View(c) {
-              private val d = c.resources.displayMetrics.density
-              var value: Int? = null
-                  set(v) { field = v; invalidate() }
-              private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 16f * d; color = Color.parseColor("#1E293B"); strokeCap = Paint.Cap.ROUND }
-              private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 16f * d; strokeCap = Paint.Cap.ROUND }
-              private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 52f * d; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
-              private val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GRAY; textSize = 16f * d; textAlign = Paint.Align.CENTER }
-              private val rect = RectF()
-
-              override fun onMeasure(wSpec: Int, hSpec: Int) {
-                  val s = minOf(View.MeasureSpec.getSize(wSpec), (300 * d).toInt())
-                  setMeasuredDimension(s, (s * 0.82f).toInt())
-              }
-
-              override fun onDraw(canvas: Canvas) {
-                  val w = width.toFloat()
-                  val pad = 14f * d
-                  rect.set(pad, pad, w - pad, w - pad)
-                  canvas.drawArc(rect, 150f, 240f, false, track)
-                  val v = value
-                  if (v != null) {
-                      val frac = ((v + 90) / 50f).coerceIn(0f, 1f)
-                      arc.color = when { v >= -70 -> Color.GREEN; v >= -80 -> Color.YELLOW; else -> Color.RED }
-                      canvas.drawArc(rect, 150f, 240f * frac, false, arc)
-                  }
-                  canvas.drawText("RX", w / 2, w / 2 - 28f * d, small)
-                  canvas.drawText(v?.toString() ?: "--", w / 2, w / 2 + 14f * d, big)
-                  canvas.drawText("dBm", w / 2, w / 2 + 38f * d, small)
-              }
-          }
-
-          /** رسم بياني لحركة الإشارة خلال الوقت (آخر 60 قراءة حقيقية من الجهاز) */
-          class GraphView(c: Context) : View(c) {
-              private val d = c.resources.displayMetrics.density
-              private val data = ArrayList<Int>()
-              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.5f * d; color = Color.CYAN; strokeJoin = Paint.Join.ROUND }
-              private val grid = Paint().apply { color = Color.parseColor("#1E293B"); strokeWidth = d }
-              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GRAY; textSize = 11f * d }
-              private val path = Path()
-
-              fun add(v: Int) { data.add(v); while (data.size > 60) data.removeAt(0); invalidate() }
-
-              override fun onMeasure(wSpec: Int, hSpec: Int) {
-                  setMeasuredDimension(View.MeasureSpec.getSize(wSpec), (140 * d).toInt())
-              }
-
-              override fun onDraw(canvas: Canvas) {
-                  val w = width.toFloat(); val h = height.toFloat(); val m = 10f * d
-                  for (i in 0..4) { val y = m + (h - 2 * m) * i / 4f; canvas.drawLine(m, y, w - m, y, grid) }
-                  canvas.drawText("-40", m + 2f * d, m + 12f * d, txt)
-                  canvas.drawText("-90", m + 2f * d, h - m - 3f * d, txt)
-                  val n = data.size
-                  if (n < 2) { canvas.drawText("شغّل المراقبة أو كرر الفحص لرسم حركة الإشارة", m * 3, h / 2, txt); return }
-                  path.reset()
-                  for (i in 0 until n) {
-                      val frac = ((data[i] + 90) / 50f).coerceIn(0f, 1f)
-                      val x = m + (w - 2 * m) * i / (n - 1)
-                      val y = h - m - frac * (h - 2 * m)
-                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                  }
-                  canvas.drawPath(path, line)
-              }
-          }
-          NETCHECK_EOF
-      - name: Build
-        run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NetCheck-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          /** الأجهزة المحلية بشهادات ذاتية: يُتجاوز التحقق من الشهادة فقط للعناوين المحلية (192.168 / 10 / 172.16-31) */
+          private fun relax(c: HttpURLConnection) {
+              
