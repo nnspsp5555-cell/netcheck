@@ -184,6 +184,17 @@ jobs:
               override fun onDestroy() { monitoring = false; super.onDestroy() }
 
               private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              /** يستعمل عنوان الصحن المحفوظ لنفس الراوتر، وإلا يبحث عنه في شبكة الراوتر ثم يحفظه */
+              private fun autoDish(gwIp: String, meInt: Int): DevConfig? {
+                  val p = getSharedPreferences("auto", 0)
+                  val saved = if (p.getString("gw", null) == gwIp) p.getString("ip", null) else null
+                  if (saved != null) return DevConfig("other", saved, "", "")
+                  val me = if (meInt != 0) "${meInt and 255}.${meInt shr 8 and 255}.${meInt shr 16 and 255}.${meInt shr 24 and 255}" else null
+                  val found = Scanner.find(gwIp, me) ?: return null
+                  p.edit().putString("gw", gwIp).putString("ip", found).apply()
+                  return DevConfig("other", found, "", "")
+              }
               private fun card(): LinearLayout = LinearLayout(this).apply {
                   orientation = LinearLayout.VERTICAL; setPadding(px(14), px(12), px(14), px(12))
                   background = GradientDrawable().apply { setColor(Color.parseColor("#111A2E")); cornerRadius = px(16).toFloat() }
@@ -248,7 +259,7 @@ jobs:
                       .setPositiveButton("حفظ") { _, _ ->
                           cfg = DevConfig(types[sp.selectedItemPosition], ip.text.toString().trim(), us.text.toString().trim(), pw.text.toString())
                           cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
-                      }.setNegativeButton("إلغاء", null).show()
+                      }.setNegativeButton("إلغاء", null).setNeutralButton("إعادة البحث التلقائي") { _, _ -> getSharedPreferences("auto", 0).edit().clear().apply() }.show()
               }
 
               private fun showHistory() {
@@ -272,11 +283,11 @@ jobs:
               // ---------- المرحلة 3: الصحن والكيبل ----------
               private fun fmtUp(s: Long) = "${s / 86400}d ${s % 86400 / 3600}h ${s % 3600 / 60}m"
 
-              private fun devResults(d: DevData?): List<Result> {
-                  val none = "غير متاح: لم يُضف جهاز الصحن. افتح «إعدادات الجهاز»."
+              private fun devResults(d: DevData?, c: DevConfig = cfg): List<Result> {
+                  val none = "غير متاح: لم يُعثر على الصحن تلقائياً في شبكة الراوتر. أضف عنوانه من «إعدادات الجهاز»."
                   if (d == null) return listOf("إشارة الصحن (dBm)", "Noise و SNR", "كيبل الصحن ومحوّل PoE", "Ethernet بين PoE والراوتر", "الكهرباء والتغذية").map { Result(it, null, none) }
                   if (!d.reachable) return listOf(
-                      Result("إشارة الصحن (dBm)", false, "الصحن لا يستجيب على ${cfg.ip}: لا يمكن قراءة الإشارة"),
+                      Result("إشارة الصحن (dBm)", false, "الصحن لا يستجيب على ${c.ip}: لا يمكن قراءة الإشارة"),
                       Result("Noise و SNR", null, "غير متاح: الصحن لا يستجيب"),
                       Result("كيبل الصحن ومحوّل PoE", false, "الصحن لا يستجيب على الشبكة: كيبل أو PoE أو كهرباء (محتمل)"),
                       Result("Ethernet بين PoE والراوتر", null, "غير متاح: الصحن لا يستجيب"),
@@ -343,8 +354,15 @@ jobs:
                   btn.isEnabled = false; out.removeAllViews(); summary.removeAllViews(); verdict.text = "جاري الفحص..."; verdict.setTextColor(Color.YELLOW)
                   thread { try {
                       val r = mutableListOf<Result>()
-                      val d: DevData? = if (cfg.enabled) (reader ?: DeviceReader(cfg).also { reader = it }).read() else null
-                      r += devResults(d)
+                      val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                      @Suppress("DEPRECATION") val info = wm.connectionInfo
+                      @Suppress("DEPRECATION") val dh = wm.dhcpInfo
+                      val gw = dh?.gateway ?: 0
+                      val gwIp = if (gw != 0) "${gw and 255}.${gw shr 8 and 255}.${gw shr 16 and 255}.${gw shr 24 and 255}" else null
+                      // إذا لم يُضف جهاز يدوياً: يبحث التطبيق عن الصحن تلقائياً (ويحفظ عنوانه لنفس الراوتر)
+                      val autoCfg: DevConfig? = if (cfg.enabled || gwIp == null) null else autoDish(gwIp, dh?.ipAddress ?: 0)
+                      val d: DevData? = if (cfg.enabled) (reader ?: DeviceReader(cfg).also { reader = it }).read() else autoCfg?.let { DeviceReader(it).read() }
+                      r += devResults(d, if (cfg.enabled) cfg else (autoCfg ?: cfg))
                       val dn = dropNote
                       r += when {
                           dn != null -> Result("تغيّر الإشارة", false, dn)
@@ -352,10 +370,6 @@ jobs:
                           else -> Result("تغيّر الإشارة", null, "غير متاح: شغّل «مراقبة الاستقرار» مع جهاز صحن مُضاف")
                       }
 
-                      val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-                      @Suppress("DEPRECATION") val info = wm.connectionInfo
-                      @Suppress("DEPRECATION") val gw = wm.dhcpInfo?.gateway ?: 0
-                      val gwIp = if (gw != 0) "${gw and 255}.${gw shr 8 and 255}.${gw shr 16 and 255}.${gw shr 24 and 255}" else null
                       val gwPing = gwIp?.let { ping(it) }
                       val routerOk = gwPing != null && gwPing.loss < 100
                       r += Result("1. اتصال الهاتف بالراوتر", if (gwIp == null) false else routerOk,
@@ -578,6 +592,37 @@ jobs:
 
           private fun num(s: String?) = s?.let { Regex("-?\\d+").find(it)?.value?.toIntOrNull() }
 
+          /** اكتشاف تلقائي لجهاز الصحن داخل شبكة الراوتر بدون كلمة مرور: يتعرف عليه من صفحة الدخول أو منفذ Winbox */
+          object Scanner {
+              private val sigs = listOf("airos", "ubiquiti", "ubnt", "airmax", "routeros", "mikrotik", "tp-link", "tplink", "nanostation", "litebeam", "powerbeam", "nanobeam")
+
+              private fun portOpen(h: String, port: Int, ms: Int) = try { Socket().use { it.connect(InetSocketAddress(h, port), ms); true } } catch (e: Exception) { false }
+
+              private fun isDish(h: String): Boolean {
+                  if (portOpen(h, 8291, 300)) return true
+                  if (!portOpen(h, 80, 400)) return false
+                  return try {
+                      val c = URL("http://$h/").openConnection() as HttpURLConnection
+                      c.connectTimeout = 1000; c.readTimeout = 1500
+                      val code = c.responseCode
+                      val head = c.headerFields.entries.joinToString(" ") { (it.key ?: "") + " " + it.value.joinToString(" ") }
+                      val body = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { r -> val b = CharArray(4000); val n = r.read(b); if (n > 0) String(b, 0, n) else "" } ?: ""
+                      val t = (head + " " + body).lowercase()
+                      sigs.any { t.contains(it) }
+                  } catch (e: Exception) { false }
+              }
+
+              fun find(gw: String, me: String?): String? {
+                  val base = gw.substringBeforeLast(".") + "."
+                  val found = java.util.concurrent.ConcurrentLinkedQueue<String>()
+                  val pool = java.util.concurrent.Executors.newFixedThreadPool(48)
+                  for (i in 1..254) { val h = base + i; if (h != gw && h != me) pool.execute { if (isDish(h)) found.add(h) } }
+                  pool.shutdown()
+                  pool.awaitTermination(25, java.util.concurrent.TimeUnit.SECONDS)
+                  return found.sortedBy { it.substringAfterLast(".").toInt() }.firstOrNull()
+              }
+          }
+
           class DeviceReader(private val cfg: DevConfig) {
               private val cookies = mutableMapOf<String, String>()
 
@@ -609,7 +654,7 @@ jobs:
                   val ip = cfg.ip
                   val https = open(ip, 443); val plain = open(ip, 80)
                   if (!https && !plain) return DevData(false, cfg.type == "ubiquiti" || cfg.type == "mikrotik")
-                  if (cfg.type == "other") return DevData(true, false, "هذا النوع غير مدعوم لقراءة الإشارة حالياً: يُفحص وصول الجهاز فقط")
+                  if (cfg.type == "other") return DevData(true, false, "غير متاح: قراءة الإشارة تتطلب بيانات دخول الصحن (إعدادات الجهاز)؛ يُفحص وصول الجهاز فقط")
                   val base = (if (https) "https://" else "http://") + ip
                   return try { if (cfg.type == "ubiquiti") ubnt(base) else mt(base) } catch (e: Exception) { DevData(true, true, "تعذّرت القراءة: ${e.message}") }
               }
