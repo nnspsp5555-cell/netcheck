@@ -95,6 +95,7 @@ jobs:
           data class Result(val title: String, val ok: Boolean?, val detail: String, val warn: Boolean = false) // ok=null => غير متاح
           data class PingStat(val loss: Int, val minMs: Double?, val avgMs: Double?, val jitterMs: Double?)
           data class Diag(val level: Int, val location: String, val cause: String, val fix: String) // 0 سليم، 1 تحذير، 2 عطل
+          data class Hop(val ip: String, val stat: PingStat)
 
           private const val SEP = "\n==========\n"
 
@@ -192,13 +193,13 @@ jobs:
                   LinearLayout.LayoutParams(w, h, weight).apply { setMargins(px(side), px(top), px(side), 0) }
 
               /** تحديث لوحة الصحن: كل قيمة تُعرض فقط إذا وفّرها الجهاز، وإلا "غير متاح" */
-              private fun updateDash(d: DevData?) {
+              private fun updateDash(d: DevData?, est: Pair<String, Int>? = null) {
                   val sig = d?.signal
                   val dead = d != null && (!d.reachable || d.linked == false)
                   val (st, sc) = when {
-                      d == null -> "غير متاح" to Color.GRAY
+                      d == null -> est ?: ("غير متاح" to Color.GRAY)
                       dead -> "منقطع" to Color.RED
-                      sig == null -> "غير متاح" to Color.GRAY
+                      sig == null -> est ?: ("غير متاح" to Color.GRAY)
                       sig >= -60 -> "ممتاز" to Color.GREEN
                       sig >= -70 -> "جيد" to Color.parseColor("#84CC16")
                       sig >= -80 -> "ضعيف" to Color.YELLOW
@@ -315,7 +316,7 @@ jobs:
               // ---------- المرحلة 4: التشخيص الذكي ----------
               private fun diagnose(d: DevData?, gwIp: String?, routerOk: Boolean, netUp: Boolean, dnsOk: Boolean, poor: Boolean, drop: String?): Diag {
                   val sig = d?.signal; val snr = d?.snr
-                  val dishGood = d != null && d.reachable && (sig == null || sig >= -70) && (snr == null || snr >= 25) && d.linked != false
+                  val dishGood = d != null && d.reachable && sig != null && sig >= -70 && (snr == null || snr >= 25) && d.linked != false
                   return when {
                       gwIp == null -> Diag(2, "الهاتف / Wi-Fi", "الهاتف غير متصل بشبكة Wi-Fi", "فعّل Wi-Fi واتصل بشبكة الراوتر ثم أعد الفحص")
                       !routerOk -> Diag(2, "الراوتر", "الراوتر لا يستجيب (ضعف Wi-Fi أو تعليق)", "قرّب الهاتف من الراوتر، أعد تشغيله، وافحص كيبل PoE بين المحوّل والراوتر")
@@ -323,6 +324,7 @@ jobs:
                       d?.ethUp == false -> Diag(2, "كيبل Ethernet بين PoE والراوتر", "منفذ Ethernet في الصحن غير موصول", "افحص الكيبل من المحوّل إلى الصحن وإلى الراوتر، وبدّل القوابس التالفة")
                       d?.linked == false -> Diag(2, "الصحن / البرج", "الصحن يعمل لكنه غير مرتبط بالبرج", "افحص اتجاه الصحن ووجود عوائق، ثم اتصل بالمزود")
                       (sig != null && sig < -80) || (snr != null && snr < 15) -> Diag(2, "إشارة الصحن", "إشارة ضعيفة جداً" + (if (drop != null) "، مع انخفاض مفاجئ: احتمال تحرك الصحن" else ""), "أعد توجيه الصحن نحو البرج وأزل العوائق وافحص قوابس الكيبل")
+                      !netUp && d != null && d.reachable && sig == null -> Diag(2, "البرج أو المزود أو اتجاه الصحن", "الراوتر والصحن يستجيبان (الكيبل وPoE يعملان) لكن لا يوجد إنترنت، وإشارة الصحن غير مقروءة", "اتصل بالمزود وأبلغه، وافحص اتجاه الصحن وعوائق أمامه")
                       !netUp -> if (dishGood) Diag(2, "البرج / مزود الإنترنت", "الصحن والإشارة سليمان لكن لا يوجد إنترنت", "اتصل بمزود الإنترنت وأبلغه بالانقطاع")
                           else Diag(2, "غير محدد: الصحن أو الكيبل أو PoE أو البرج أو المزود", "الراوتر يعمل لكن لا يوجد إنترنت، ولا تتوفر بيانات الصحن لتحديد الموضع", "أضف جهاز الصحن من «إعدادات الجهاز» لتحديد دقيق، وافحص إضاءة PoE")
                       !dnsOk -> Diag(2, "DNS", "الإنترنت يعمل لكن DNS لا يعمل", "غيّر DNS في الراوتر إلى 1.1.1.1 أو 8.8.8.8")
@@ -376,6 +378,9 @@ jobs:
                       val speedR = Result("7. سرعة Download و Upload", down != null && up != null && down >= 1 && up >= 0.5,
                           "تنزيل: ${down?.let { "%.1f Mbps".format(it) } ?: "فشل"}، رفع: ${up?.let { "%.1f Mbps".format(it) } ?: "فشل"}", down != null && up != null && (down < 5 || up < 1))
                       r += listOf(pingR, lossR, dnsR, speedR)
+                      val hops = if (netUp) findHops("1.1.1.1", gwIp) else emptyList()
+                      val (linkRes, est) = linkEstimate(hops, netUp)
+                      r += linkRes
 
                       val poor = netUp && listOf(pingR, lossR, speedR).any { it.ok == false || it.warn }
                       val dg = diagnose(d, gwIp, routerOk, netUp, dnsOk, poor, dn)
@@ -387,7 +392,7 @@ jobs:
                       }
                       lastReport = rep; saveHistory(rep)
                       runOnUiThread {
-                          updateDash(d)
+                          updateDash(d, est)
                           summary.removeAllViews()
                           sumRow("الإنترنت: " + (if (netUp) "يعمل" else "منقطع"), colorOf(netUp, false))
                           sumRow("الراوتر: " + (if (routerOk) "متصل ($gwIp)" else "غير متصل"), colorOf(routerOk, false))
@@ -443,6 +448,40 @@ jobs:
                           try { Thread.sleep(3000) } catch (e: InterruptedException) { }
                       }
                   }
+              }
+
+              /** يجد عنوان أول نقاط بعد الراوتر عبر ping بقيمة TTL صغيرة (بدون أي دخول للصحن) */
+              private fun hopIp(target: String, ttl: Int): String? = try {
+                  val p = ProcessBuilder("ping", "-c", "1", "-W", "2", "-t", "$ttl", target).redirectErrorStream(true).start()
+                  val txt = p.inputStream.bufferedReader().readText(); p.waitFor()
+                  Regex("[Ff]rom ([\\d.]+)").find(txt)?.groupValues?.get(1)
+              } catch (e: Exception) { null }
+
+              private fun findHops(target: String, gw: String?): List<Hop> {
+                  val seen = mutableListOf<String>()
+                  for (ttl in 2..4) {
+                      val ip = hopIp(target, ttl) ?: continue
+                      if (ip == target) break
+                      if (ip == gw || ip in seen) continue
+                      seen += ip
+                  }
+                  return seen.take(2).map { Hop(it, ping(it, 6)) }
+              }
+
+              /** تقدير غير مباشر لجودة رابط الصحن مع البرج من تأخير وJitter وفقدان أول نقطة بعد الراوتر (ليس dBm) */
+              private fun linkEstimate(hops: List<Hop>, netUp: Boolean): Pair<Result, Pair<String, Int>?> {
+                  val title = "جودة رابط الصحن مع البرج (تقدير غير مباشر)"
+                  if (!netUp) return Result(title, null, "غير متاح: لا يوجد إنترنت للقياس") to null
+                  val h = hops.firstOrNull() ?: return Result(title, null, "غير متاح: تعذّر تحديد أول نقطة بعد الراوتر (قد تحجب الأجهزة ردود ping)") to null
+                  val s = h.stat
+                  if (s.loss >= 100) return Result(title, null, "غير متاح: أول نقطة بعد الراوتر (${h.ip}) لا ترد على ping") to null
+                  val avg = s.avgMs ?: 0.0; val jit = s.jitterMs ?: 0.0
+                  val bad = s.loss > 5 || jit > 20 || avg > 60
+                  val mid = !bad && (s.loss > 1 || jit > 8 || avg > 25)
+                  val word = if (bad) "ضعيف" else if (mid) "متوسط" else "جيد"
+                  val txt = "%s: تأخير %.0f ms، Jitter %.1f ms، فقدان %d%%: %s (تقدير من التأخير وليس قراءة dBm)".format(h.ip, avg, jit, s.loss, word)
+                  val col = if (bad) Color.RED else if (mid) Color.YELLOW else Color.GREEN
+                  return Result(title, !bad, txt, mid) to ("$word (تقدير)" to col)
               }
 
               private fun ping(host: String, count: Int = 8): PingStat = try {
