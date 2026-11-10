@@ -732,4 +732,214 @@ jobs:
 
           /** الأجهزة المحلية بشهادات ذاتية: يُتجاوز التحقق من الشهادة فقط للعناوين المحلية (192.168 / 10 / 172.16-31) */
           private fun relax(c: HttpURLConnection) {
-              
+              if (c !is HttpsURLConnection) return
+              val h = c.url.host
+              if (!(h.startsWith("192.168.") || h.startsWith("10.") || Regex("^172\\.(1[6-9]|2\\d|3[01])\\.").containsMatchIn(h))) return
+              val tm = arrayOf<TrustManager>(object : X509TrustManager {
+                  override fun checkClientTrusted(a: Array<X509Certificate>?, t: String?) {}
+                  override fun checkServerTrusted(a: Array<X509Certificate>?, t: String?) {}
+                  override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
+              })
+              val ctx = SSLContext.getInstance("TLS"); ctx.init(null, tm, null)
+              c.sslSocketFactory = ctx.socketFactory; c.hostnameVerifier = HostnameVerifier { _, _ -> true }
+          }
+
+          data class Found(val ip: String, val kind: String) // kind: ubiquiti | mikrotik | other
+
+          /** اكتشاف الصحن داخل شبكة الراوتر (نفس النطاق /24) بدون أي كلمة مرور: يتعرف عليه من صفحة الدخول أو منفذ Winbox */
+          object Scanner {
+              private val ubnt = listOf("airos", "ubiquiti", "ubnt", "airmax", "nanostation", "litebeam", "powerbeam", "nanobeam")
+              private val mtik = listOf("routeros", "mikrotik")
+              private val tpl = listOf("tp-link", "tplink")
+
+              private fun portOpen(h: String, port: Int, ms: Int) = try { Socket().use { it.connect(InetSocketAddress(h, port), ms); true } } catch (e: Exception) { false }
+
+              private fun look(url: String): String = try {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  relax(c); c.connectTimeout = 1000; c.readTimeout = 1500; c.instanceFollowRedirects = false
+                  val code = c.responseCode
+                  val head = c.headerFields.entries.joinToString(" ") { (it.key ?: "") + " " + it.value.joinToString(" ") }
+                  val body = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { r -> val b = CharArray(4000); val n = r.read(b); if (n > 0) String(b, 0, n) else "" } ?: ""
+                  (head + " " + body).lowercase()
+              } catch (e: Exception) { "" }
+
+              private fun probe(h: String): String? {
+                  if (portOpen(h, 8291, 300)) return "mikrotik"
+                  val txt = (if (portOpen(h, 80, 400)) look("http://$h/") else "") + " " + (if (portOpen(h, 443, 400)) look("https://$h/") else "")
+                  return when {
+                      ubnt.any { txt.contains(it) } -> "ubiquiti"
+                      mtik.any { txt.contains(it) } -> "mikrotik"
+                      tpl.any { txt.contains(it) } -> "other"
+                      else -> null
+                  }
+              }
+
+              fun findAll(gw: String, me: String?): List<Found> {
+                  val base = gw.substringBeforeLast(".") + "."
+                  val found = java.util.concurrent.ConcurrentLinkedQueue<Found>()
+                  val pool = java.util.concurrent.Executors.newFixedThreadPool(48)
+                  for (i in 1..254) { val h = base + i; if (h != gw && h != me) pool.execute { val k = probe(h); if (k != null) found.add(Found(h, k)) } }
+                  pool.shutdown()
+                  pool.awaitTermination(25, java.util.concurrent.TimeUnit.SECONDS)
+                  pool.shutdownNow()
+                  return found.sortedBy { it.ip.substringAfterLast(".").toInt() }
+              }
+
+              fun find(gw: String, me: String?): String? = findAll(gw, me).firstOrNull()?.ip
+          }
+
+          class DeviceReader(private val cfg: DevConfig) {
+              private val cookies = mutableMapOf<String, String>()
+
+              private fun open(ip: String, port: Int) = try { Socket().use { it.connect(InetSocketAddress(ip, port), 1500); true } } catch (e: Exception) { false }
+
+              private fun http(url: String, method: String = "GET", body: ByteArray? = null, ctype: String? = null, auth: String? = null): Pair<Int, String> {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  relax(c)
+                  c.requestMethod = method; c.connectTimeout = 4000; c.readTimeout = 6000; c.instanceFollowRedirects = false
+                  if (cookies.isNotEmpty()) c.setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                  if (auth != null) c.setRequestProperty("Authorization", auth)
+                  if (ctype != null) c.setRequestProperty("Content-Type", ctype)
+                  if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body) } }
+                  val code = c.responseCode
+                  c.headerFields["Set-Cookie"]?.forEach { sc -> val kv = sc.substringBefore(";"); if (kv.contains("=")) cookies[kv.substringBefore("=").trim()] = kv.substringAfter("=").trim() }
+                  val txt = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                  return code to txt
+              }
+
+              @Synchronized fun read(): DevData {
+                  val ip = cfg.ip
+                  val https = open(ip, 443); val plain = open(ip, 80)
+                  if (!https && !plain) return DevData(false, cfg.type == "ubiquiti" || cfg.type == "mikrotik")
+                  if (cfg.type == "other") return DevData(true, false, "غير متاح: قراءة الإشارة تتطلب بيانات دخول الصحن (إعدادات الجهاز)؛ يُفحص وصول الجهاز فقط")
+                  val base = (if (https) "https://" else "http://") + ip
+                  return try { if (cfg.type == "ubiquiti") ubnt(base) else mt(base) } catch (e: Exception) { DevData(true, true, "تعذّرت القراءة: ${e.message}") }
+              }
+
+              private fun ubnt(b: String): DevData {
+                  cookies.clear()
+                  http("$b/login.cgi")
+                  val bd = "----netcheck"
+                  fun part(n: String, v: String) = "--$bd\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n"
+                  val form = part("username", cfg.user) + part("password", cfg.pass) + part("uri", "/status.cgi") + "--$bd--\r\n"
+                  http("$b/login.cgi", "POST", form.toByteArray(), "multipart/form-data; boundary=$bd")
+                  var txt = http("$b/status.cgi").second
+                  if (!txt.trimStart().startsWith("{")) { // airOS الأحدث
+                      http("$b/api/auth", "POST", JSONObject().put("username", cfg.user).put("password", cfg.pass).toString().toByteArray(), "application/json")
+                      txt = http("$b/status.cgi").second
+                  }
+                  if (!txt.trimStart().startsWith("{")) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور ونوع الجهاز")
+                  val j = JSONObject(txt); val w = j.optJSONObject("wireless"); val h = j.optJSONObject("host")
+                  val sig = w?.optInt("signal", 0)?.takeIf { it != 0 }
+                  val noise = w?.optInt("noisef", 0)?.takeIf { it != 0 }
+                  val tx = w?.optInt("txpower", 0)?.takeIf { it != 0 }
+                  val linked: Boolean? = if (w != null && w.optString("opmode") == "sta") sig != null else null
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val arr = j.optJSONArray("interfaces")
+                  if (arr != null) for (i in 0 until arr.length()) {
+                      val o = arr.optJSONObject(i) ?: continue
+                      val st = o.optJSONObject("status")
+                      if (o.optString("ifname") == "eth0" && st != null) { ethUp = st.optInt("plugged", 0) == 1; spd = st.optInt("speed", 0).takeIf { it > 0 } }
+                  }
+                  val up = h?.optLong("uptime", -1)?.takeIf { it >= 0 }
+                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null, tx)
+              }
+
+              private fun mt(b: String): DevData {
+                  val auth = "Basic " + Base64.encodeToString("${cfg.user}:${cfg.pass}".toByteArray(), Base64.NO_WRAP)
+                  fun get(path: String) = http("$b/rest/$path", auth = auth)
+                  val probe = get("system/resource")
+                  if (probe.first == 401) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور")
+                  if (probe.first != 200) return DevData(true, true, "REST API غير متاح (يتطلب RouterOS 7.1+ مع تفعيل خدمة www)")
+                  var reg = get("interface/wifi/registration-table")
+                  if (reg.first != 200) reg = get("interface/wireless/registration-table")
+                  var linked: Boolean? = null; var sig: Int? = null; var snr: Int? = null; var noise: Int? = null
+                  if (reg.first == 200) {
+                      val a = JSONArray(reg.second); linked = a.length() > 0
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0)
+                          sig = num(o.optString("signal").ifEmpty { o.optString("signal-strength") })
+                          snr = num(o.optString("signal-to-noise")); noise = num(o.optString("noise-floor"))
+                          if (snr == null && sig != null && noise != null) snr = sig - noise
+                          if (noise == null && sig != null && snr != null) noise = sig - snr
+                      }
+                  }
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val eth = get("interface/ethernet")
+                  if (eth.first == 200) {
+                      val a = JSONArray(eth.second)
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0); ethUp = o.optString("running") == "true"
+                          val rate = o.optString("rate")
+                          spd = when { rate.contains("10Gbps") -> 10000; rate.contains("2.5Gbps") -> 2500; rate.contains("1Gbps") -> 1000; rate.contains("100Mbps") -> 100; rate.contains("10Mbps") -> 10; else -> null }
+                      }
+                  }
+                  var v: Double? = null
+                  val hl = get("system/health")
+                  if (hl.first == 200) {
+                      val t = hl.second.trim()
+                      if (t.startsWith("[")) { val a = JSONArray(t); for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("name") == "voltage") v = o.optString("value").toDoubleOrNull() } }
+                      else v = JSONObject(t).optString("voltage").toDoubleOrNull()
+                  }
+                  var tx: Int? = null
+                  try {
+                      val wl = get("interface/wireless")
+                      if (wl.first == 200) { val a = JSONArray(wl.second); if (a.length() > 0) tx = num(a.getJSONObject(0).optString("tx-power"))?.takeIf { it in 1..40 } }
+                  } catch (e: Exception) { }
+                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v, tx)
+              }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/UiViews.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/UiViews.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.view.View
+
+          /** رسم بياني لحركة الإشارة خلال الوقت (آخر 60 قراءة حقيقية من الجهاز، المدى -90 إلى -40 dBm) */
+          class GraphView(c: Context) : View(c) {
+              private val d = c.resources.displayMetrics.density
+              private val values = ArrayList<Int>()
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f * d; color = Color.parseColor("#34D399"); strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND }
+              private val grid = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = d; color = Color.parseColor("#3A4C70"); pathEffect = DashPathEffect(floatArrayOf(6f * d, 6f * d), 0f) }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#8FA3C7"); textSize = 12f * d; textAlign = Paint.Align.CENTER }
+              private val path = Path()
+
+              fun add(v: Int) {
+                  values.add(v); while (values.size > 60) values.removeAt(0)
+                  line.color = when { v >= -70 -> Color.parseColor("#34D399"); v >= -80 -> Color.parseColor("#FACC15"); else -> Color.parseColor("#F87171") }
+                  invalidate()
+              }
+
+              override fun onMeasure(wSpec: Int, hSpec: Int) {
+                  setMeasuredDimension(View.MeasureSpec.getSize(wSpec), (150 * d).toInt())
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat(); val m = 12f * d
+                  for (i in 0..2) { val y = m + (h - 2 * m) * i / 2f; path.reset(); path.moveTo(m, y); path.lineTo(w - m, y); canvas.drawPath(path, grid) }
+                  val n = values.size
+                  if (n < 2) { canvas.drawText("لا توجد قراءات بعد: اقرأ إشارة الصحن وشغّل المراقبة", w / 2, h / 2, txt); return }
+                  path.reset()
+                  for (i in 0 until n) {
+                      val frac = ((values[i] + 90) / 50f).coerceIn(0f, 1f)
+                      val x = m + (w - 2 * m) * i / (n - 1)
+                      val y = h - m - frac * (h - 2 * m)
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  canvas.drawPath(path, line)
+              }
+          }
+          NETCHECK_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetCheck-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
