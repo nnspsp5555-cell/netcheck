@@ -1,0 +1,562 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'NETCHECK_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NetCheck"
+          include(":app")
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'NETCHECK_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'NETCHECK_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'NETCHECK_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.netcheck"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'NETCHECK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <application android:label="NET CHECK" android:allowBackup="false" android:supportsRtl="true"
+                  android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/MainActivity.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.InetAddress
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.concurrent.thread
+
+          data class Result(val title: String, val ok: Boolean?, val detail: String, val warn: Boolean = false) // ok=null => غير متاح
+          data class PingStat(val loss: Int, val minMs: Double?, val avgMs: Double?, val jitterMs: Double?)
+          data class Diag(val level: Int, val location: String, val cause: String, val fix: String) // 0 سليم، 1 تحذير، 2 عطل
+
+          private const val SEP = "\n==========\n"
+
+          class MainActivity : Activity() {
+              private lateinit var out: LinearLayout
+              private lateinit var btn: Button
+              private lateinit var monBtn: Button
+              private lateinit var summary: LinearLayout
+              private lateinit var verdict: TextView
+              private lateinit var monitorView: TextView
+              private lateinit var cfg: DevConfig
+              private var reader: DeviceReader? = null
+              @Volatile private var checking = false
+              @Volatile private var monitoring = false
+              @Volatile private var monGen = 0
+              @Volatile private var dropNote: String? = null
+              @Volatile private var lastReport = ""
+              private val histFile by lazy { File(filesDir, "history.txt") }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  cfg = DevConfig.load(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40); setBackgroundColor(Color.parseColor("#0B1220")); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+                  root.addView(tv("NET CHECK", 28f, Color.WHITE, true))
+                  btn = Button(this).apply { text = "ابدأ الفحص"; textSize = 20f; setOnClickListener { runCheck() } }
+                  root.addView(btn)
+                  monBtn = Button(this).apply { text = "مراقبة الاستقرار"; textSize = 16f; setOnClickListener { toggleMonitor() } }
+                  root.addView(monBtn)
+                  root.addView(LinearLayout(this).apply {
+                      addView(small("إعدادات الجهاز") { settings() }); addView(small("السجل") { showHistory() }); addView(small("مشاركة التقرير") { share() })
+                  })
+                  summary = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 24, 0, 0) }
+                  root.addView(summary)
+                  verdict = tv("", 18f, Color.YELLOW, true).apply { setPadding(0, 16, 0, 8) }
+                  root.addView(verdict)
+                  monitorView = tv("", 15f, Color.CYAN)
+                  root.addView(monitorView)
+                  out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(ScrollView(this).apply { addView(out) })
+                  setContentView(root)
+              }
+
+              // توفير البطارية: تتوقف المراقبة عند خروج التطبيق من الشاشة
+              override fun onStop() { if (monitoring) { monitoring = false; monBtn.text = "مراقبة الاستقرار" }; super.onStop() }
+
+              override fun onDestroy() { monitoring = false; super.onDestroy() }
+
+              private fun tv(t: String, size: Float, c: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(c); gravity = Gravity.START
+                  if (bold) setTypeface(null, Typeface.BOLD)
+              }
+              private fun small(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; textSize = 13f; setOnClickListener { f() }
+                  layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+              }
+              private fun colorOf(ok: Boolean?, warn: Boolean) = when { ok == null -> Color.GRAY; !ok -> Color.RED; warn -> Color.YELLOW; else -> Color.GREEN }
+              private fun sumRow(t: String, c: Int) { summary.addView(tv(t, 20f, c, true).apply { setPadding(0, 6, 0, 6) }) }
+
+              // ---------- إعدادات الجهاز / السجل / المشاركة ----------
+              private fun settings() {
+                  val types = arrayOf("none", "ubiquiti", "mikrotik", "other")
+                  val names = arrayOf("بدون جهاز", "Ubiquiti (airOS)", "MikroTik (RouterOS 7)", "أخرى / TP-Link (فحص الوصول فقط)")
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 0); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+                  val sp = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names); setSelection(types.indexOf(cfg.type).coerceAtLeast(0)) }
+                  val ip = EditText(this).apply { hint = "IP الجهاز مثل 192.168.1.20"; setText(cfg.ip) }
+                  val us = EditText(this).apply { hint = "اسم المستخدم"; setText(cfg.user) }
+                  val pw = EditText(this).apply { hint = "كلمة المرور"; setText(cfg.pass); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
+                  listOf(sp, ip, us, pw).forEach { box.addView(it) }
+                  AlertDialog.Builder(this).setTitle("إعدادات جهاز الصحن").setView(box)
+                      .setPositiveButton("حفظ") { _, _ ->
+                          cfg = DevConfig(types[sp.selectedItemPosition], ip.text.toString().trim(), us.text.toString().trim(), pw.text.toString())
+                          cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
+                      }.setNegativeButton("إلغاء", null).show()
+              }
+
+              private fun showHistory() {
+                  val t = if (histFile.exists()) histFile.readText() else ""
+                  AlertDialog.Builder(this).setTitle("سجل الفحوصات").setMessage(if (t.isBlank()) "لا يوجد سجل بعد" else t)
+                      .setPositiveButton("إغلاق", null).setNeutralButton("مسح السجل") { _, _ -> histFile.delete() }.show()
+              }
+
+              private fun share() {
+                  if (lastReport.isBlank()) { Toast.makeText(this, "أجرِ فحصاً أولاً", Toast.LENGTH_SHORT).show(); return }
+                  startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, lastReport) }, "مشاركة التقرير"))
+              }
+
+              private fun saveHistory(rep: String) {
+                  try {
+                      val old = (if (histFile.exists()) histFile.readText() else "").split(SEP).filter { it.isNotBlank() }
+                      histFile.writeText((listOf(rep) + old).take(30).joinToString(SEP)) // الأحدث أولاً
+                  } catch (e: Exception) { }
+              }
+
+              // ---------- المرحلة 3: الصحن والكيبل ----------
+              private fun fmtUp(s: Long) = "${s / 86400}d ${s % 86400 / 3600}h ${s % 3600 / 60}m"
+
+              private fun devResults(d: DevData?): List<Result> {
+                  val none = "غير متاح: لم يُضف جهاز الصحن. افتح «إعدادات الجهاز»."
+                  if (d == null) return listOf("إشارة الصحن (dBm)", "Noise و SNR", "كيبل الصحن ومحوّل PoE", "Ethernet بين PoE والراوتر", "الكهرباء والتغذية").map { Result(it, null, none) }
+                  if (!d.reachable) return listOf(
+                      Result("إشارة الصحن (dBm)", false, "الصحن لا يستجيب على ${cfg.ip}: لا يمكن قراءة الإشارة"),
+                      Result("Noise و SNR", null, "غير متاح: الصحن لا يستجيب"),
+                      Result("كيبل الصحن ومحوّل PoE", false, "الصحن لا يستجيب على الشبكة: كيبل أو PoE أو كهرباء (محتمل)"),
+                      Result("Ethernet بين PoE والراوتر", null, "غير متاح: الصحن لا يستجيب"),
+                      Result("الكهرباء والتغذية", null, "غير متاح: الصحن لا يستجيب"))
+                  val na = d.error ?: "غير متاح: الجهاز لا يدعم قراءة هذه البيانات"
+                  val l = mutableListOf<Result>()
+                  l += when {
+                      d.linked == false -> Result("إشارة الصحن (dBm)", false, "منقطعة: الصحن غير مرتبط بالبرج")
+                      d.signal != null -> {
+                          val s: Int = d.signal
+                          val txt = if (s >= -70) "قوية" else if (s >= -80) "ضعيفة" else "ضعيفة جداً"
+                          Result("إشارة الصحن (dBm)", s >= -80, "$s dBm: $txt", s in -80..-71)
+                      }
+                      else -> Result("إشارة الصحن (dBm)", null, na)
+                  }
+                  l += if (d.snr != null) {
+                      val q: Int = d.snr
+                      Result("Noise و SNR", q >= 15, "SNR $q dB" + (d.noise?.let { "، Noise $it dBm" } ?: "") + ": " + (if (q >= 25) "جيد" else if (q >= 15) "متوسط" else "ضعيف"), q in 15..24)
+                  } else Result("Noise و SNR", null, na)
+                  l += Result("كيبل الصحن ومحوّل PoE", true, "الصحن يستجيب عبر الشبكة، ما يدل على وصول التغذية والكيبل (لا يُفحص السلك كهربائياً)")
+                  l += when {
+                      d.ethUp == false -> Result("Ethernet بين PoE والراوتر", false, "المنفذ غير موصول (Link down)")
+                      d.ethUp == true -> {
+                          val sp = d.ethSpeed
+                          Result("Ethernet بين PoE والراوتر", true, "متصل" + (sp?.let { "، سرعة المنفذ $it Mbps" } ?: "") + (if (sp != null && sp <= 10) ": سرعة منخفضة قد تدل على كيبل تالف" else ""), sp != null && sp <= 10)
+                      }
+                      else -> Result("Ethernet بين PoE والراوتر", null, na)
+                  }
+                  val bits = mutableListOf<String>(); var warn = false
+                  d.voltage?.let { bits += "الجهد %.1f V".format(it) }
+                  d.uptimeSec?.let { bits += "مدة التشغيل " + fmtUp(it); if (it < 300) warn = true }
+                  l += if (bits.isEmpty()) Result("الكهرباء والتغذية", null, "غير متاح: الجهاز لا يوفّر بيانات الكهرباء")
+                  else Result("الكهرباء والتغذية", true, bits.joinToString("، ") + (if (warn) ": أُعيد تشغيله حديثاً (قد يدل على انقطاع كهرباء)" else ""), warn)
+                  return l
+              }
+
+              // ---------- المرحلة 4: التشخيص الذكي ----------
+              private fun diagnose(d: DevData?, gwIp: String?, routerOk: Boolean, netUp: Boolean, dnsOk: Boolean, poor: Boolean, drop: String?): Diag {
+                  val sig = d?.signal; val snr = d?.snr
+                  val dishGood = d != null && d.reachable && (sig == null || sig >= -70) && (snr == null || snr >= 25) && d.linked != false
+                  return when {
+                      gwIp == null -> Diag(2, "الهاتف / Wi-Fi", "الهاتف غير متصل بشبكة Wi-Fi", "فعّل Wi-Fi واتصل بشبكة الراوتر ثم أعد الفحص")
+                      !routerOk -> Diag(2, "الراوتر", "الراوتر لا يستجيب (ضعف Wi-Fi أو تعليق)", "قرّب الهاتف من الراوتر، أعد تشغيله، وافحص كيبل PoE بين المحوّل والراوتر")
+                      d != null && !d.reachable -> Diag(2, "كيبل الصحن / محوّل PoE / الكهرباء", "الراوتر يعمل لكن الصحن لا يستجيب على الشبكة", "تأكد من إضاءة محوّل PoE، ثبّت قوابس الكيبل، وجرّب كيبل أو محوّل PoE آخر")
+                      d?.ethUp == false -> Diag(2, "كيبل Ethernet بين PoE والراوتر", "منفذ Ethernet في الصحن غير موصول", "افحص الكيبل من المحوّل إلى الصحن وإلى الراوتر، وبدّل القوابس التالفة")
+                      d?.linked == false -> Diag(2, "الصحن / البرج", "الصحن يعمل لكنه غير مرتبط بالبرج", "افحص اتجاه الصحن ووجود عوائق، ثم اتصل بالمزود")
+                      (sig != null && sig < -80) || (snr != null && snr < 15) -> Diag(2, "إشارة الصحن", "إشارة ضعيفة جداً" + (if (drop != null) "، مع انخفاض مفاجئ: احتمال تحرك الصحن" else ""), "أعد توجيه الصحن نحو البرج وأزل العوائق وافحص قوابس الكيبل")
+                      !netUp -> if (dishGood) Diag(2, "البرج / مزود الإنترنت", "الصحن والإشارة سليمان لكن لا يوجد إنترنت", "اتصل بمزود الإنترنت وأبلغه بالانقطاع")
+                          else Diag(2, "غير محدد: الصحن أو الكيبل أو PoE أو البرج أو المزود", "الراوتر يعمل لكن لا يوجد إنترنت، ولا تتوفر بيانات الصحن لتحديد الموضع", "أضف جهاز الصحن من «إعدادات الجهاز» لتحديد دقيق، وافحص إضاءة PoE")
+                      !dnsOk -> Diag(2, "DNS", "الإنترنت يعمل لكن DNS لا يعمل", "غيّر DNS في الراوتر إلى 1.1.1.1 أو 8.8.8.8")
+                      drop != null -> Diag(1, "إشارة الصحن", "انخفاض مفاجئ في الإشارة: احتمال تحرك الصحن أو عائق جديد", "افحص اتجاه الصحن وثباته على الصاري")
+                      (sig != null && sig < -70) || (snr != null && snr < 25) -> Diag(1, "إشارة الصحن", "الإشارة ضعيفة نسبياً وقد تسبب بطئاً", "حسّن توجيه الصحن وأزل العوائق")
+                      poor -> if (dishGood) Diag(1, "البرج / مزود الإنترنت", "الصحن سليم لكن الجودة ضعيفة: ازدحام أو مشكلة عند المزود", "جرّب في وقت آخر أو اتصل بالمزود")
+                          else Diag(1, "غير محدد", "جودة الاتصال ضعيفة (بطء/بنغ/فقدان حزم)", "أضف جهاز الصحن من «إعدادات الجهاز» لتحديد السبب بدقة")
+                      else -> Diag(0, "لا يوجد عطل", "لم يُكتشف عطل في الأجزاء التي أمكن فحصها", "لا حاجة لإجراء")
+                  }
+              }
+
+              // ---------- الفحص الكامل ----------
+              private fun runCheck() {
+                  if (checking) return
+                  checking = true
+                  btn.isEnabled = false; out.removeAllViews(); summary.removeAllViews(); verdict.text = "جاري الفحص..."; verdict.setTextColor(Color.YELLOW)
+                  thread { try {
+                      val r = mutableListOf<Result>()
+                      val d: DevData? = if (cfg.enabled) (reader ?: DeviceReader(cfg).also { reader = it }).read() else null
+                      r += devResults(d)
+                      val dn = dropNote
+                      r += when {
+                          dn != null -> Result("تغيّر الإشارة", false, dn)
+                          monitoring && cfg.enabled -> Result("تغيّر الإشارة", true, "لا انخفاض مفاجئ أثناء المراقبة")
+                          else -> Result("تغيّر الإشارة", null, "غير متاح: شغّل «مراقبة الاستقرار» مع جهاز صحن مُضاف")
+                      }
+
+                      val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                      @Suppress("DEPRECATION") val info = wm.connectionInfo
+                      @Suppress("DEPRECATION") val gw = wm.dhcpInfo?.gateway ?: 0
+                      val gwIp = if (gw != 0) "${gw and 255}.${gw shr 8 and 255}.${gw shr 16 and 255}.${gw shr 24 and 255}" else null
+                      val gwPing = gwIp?.let { ping(it) }
+                      val routerOk = gwPing != null && gwPing.loss < 100
+                      r += Result("1. اتصال الهاتف بالراوتر", if (gwIp == null) false else routerOk,
+                          if (gwIp == null) "غير متصل بشبكة Wi-Fi" else "Wi-Fi ${info.rssi} dBm، سرعة الربط ${info.linkSpeed} Mbps، فقدان حزم للراوتر ${gwPing?.loss}%")
+                      r += Result("2. عنوان Gateway IP", gwIp != null, gwIp ?: "غير معروف")
+
+                      val p1 = ping("1.1.1.1"); val p2 = ping("8.8.8.8")
+                      val best = listOf(p1, p2).minByOrNull { it.loss }!!
+                      val netUp = best.loss < 100
+                      r += Result("3. اتصال الإنترنت الخارجي", netUp, if (netUp) "يعمل" else "لا يوجد رد من 1.1.1.1 و8.8.8.8")
+                      val pingR = Result("4. Ping و Latency", netUp && (best.avgMs ?: 999.0) < 200,
+                          if (!netUp) "غير متاح" else "أدنى %.0f ms، متوسط %.0f ms، Jitter %.1f ms".format(best.minMs ?: 0.0, best.avgMs ?: 0.0, best.jitterMs ?: 0.0), netUp && (best.avgMs ?: 999.0) >= 100)
+                      val lossR = Result("5. Packet Loss", netUp && best.loss <= 10, "${best.loss}%", netUp && best.loss > 2)
+                      val t0 = System.nanoTime()
+                      val dnsOk = try { InetAddress.getByName("google.com"); true } catch (e: Exception) { false }
+                      val dnsMs = (System.nanoTime() - t0) / 1_000_000
+                      val dnsR = Result("6. DNS", dnsOk, if (dnsOk) "يعمل (${dnsMs} ms)" else "لا يعمل", dnsOk && dnsMs > 300)
+                      val down = if (netUp) download() else null
+                      val up = if (netUp) upload() else null
+                      val speedR = Result("7. سرعة Download و Upload", down != null && up != null && down >= 1 && up >= 0.5,
+                          "تنزيل: ${down?.let { "%.1f Mbps".format(it) } ?: "فشل"}، رفع: ${up?.let { "%.1f Mbps".format(it) } ?: "فشل"}", down != null && up != null && (down < 5 || up < 1))
+                      r += listOf(pingR, lossR, dnsR, speedR)
+
+                      val poor = netUp && listOf(pingR, lossR, speedR).any { it.ok == false || it.warn }
+                      val dg = diagnose(d, gwIp, routerOk, netUp, dnsOk, poor, dn)
+                      val time = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+                      val rep = buildString {
+                          appendLine("NET CHECK - $time")
+                          r.forEach { appendLine((when { it.ok == null -> "⚪"; it.ok == false -> "🔴"; it.warn -> "🟡"; else -> "🟢" }) + " ${it.title}: ${it.detail}") }
+                          appendLine(); appendLine("مكان العطل: ${dg.location}"); appendLine("السبب: ${dg.cause}"); append("الحل المقترح: ${dg.fix}")
+                      }
+                      lastReport = rep; saveHistory(rep)
+                      runOnUiThread {
+                          summary.removeAllViews()
+                          sumRow("الإنترنت: " + (if (netUp) "يعمل" else "منقطع"), colorOf(netUp, false))
+                          sumRow("الراوتر: " + (if (routerOk) "متصل ($gwIp)" else "غير متصل"), colorOf(routerOk, false))
+                          d?.signal?.let { s -> val x = r[0]; sumRow("إشارة الصحن: $s dBm", colorOf(x.ok, x.warn)) }
+                          sumRow("سرعة الاستجابة: " + (if (netUp) "%.0f ms".format(best.avgMs ?: 0.0) else "-"), colorOf(pingR.ok, pingR.warn))
+                          sumRow("نسبة فقدان الحزم: " + (if (netUp) "${best.loss}%" else "-"), colorOf(lossR.ok, lossR.warn))
+                          verdict.text = "مكان العطل: ${dg.location}\nالسبب: ${dg.cause}\nالحل المقترح: ${dg.fix}"
+                          verdict.setTextColor(when (dg.level) { 0 -> Color.GREEN; 1 -> Color.YELLOW; else -> Color.RED })
+                          r.forEach { x ->
+                              out.addView(tv(x.title, 17f, colorOf(x.ok, x.warn), true).apply { setPadding(0, 24, 0, 0) })
+                              out.addView(tv(x.detail, 15f, Color.LTGRAY))
+                          }
+                          btn.isEnabled = true; btn.text = "إعادة الفحص"
+                      }
+                  } catch (e: Exception) {
+                      runOnUiThread { verdict.text = "تعذّر إكمال الفحص: ${e.message}"; verdict.setTextColor(Color.RED); btn.isEnabled = true }
+                  } finally { checking = false }
+                  }
+              }
+
+              /** مراقبة الاستقرار: ping كل 3 ثوان + قراءة الإشارة إن وُجد جهاز. 3 إخفاقات متتالية = إعادة فحص تلقائي */
+              private fun toggleMonitor() {
+                  if (monitoring) { monitoring = false; monBtn.text = "مراقبة الاستقرار"; return }
+                  monitoring = true; dropNote = null; monBtn.text = "إيقاف المراقبة"
+                  val gen = ++monGen
+                  thread {
+                      var ok = 0; var fail = 0; var streak = 0
+                      var prev: Int? = null; var max: Int? = null
+                      while (monitoring && gen == monGen) {
+                          val p = ping("1.1.1.1", 1)
+                          if (p.loss < 100) { ok++; streak = 0 } else { fail++; streak++ }
+                          var sigTxt = ""
+                          if (cfg.enabled) {
+                              val sig = try { (reader ?: DeviceReader(cfg).also { reader = it }).read().signal } catch (e: Exception) { null }
+                              if (sig != null) {
+                                  sigTxt = "، الإشارة $sig dBm"
+                                  val pv = prev; val mx = max
+                                  if (dropNote == null && ((pv != null && sig <= pv - 10) || (mx != null && sig <= mx - 10)))
+                                      dropNote = "انخفضت الإشارة فجأة إلى $sig dBm (كانت ${pv ?: mx} dBm): قد يدل على تحرك الصحن أو عائق"
+                                  prev = sig; max = if (mx == null || sig > mx) sig else mx
+                              }
+                          }
+                          val total = ok + fail
+                          val note = dropNote
+                          runOnUiThread {
+                              monitorView.text = "المراقبة: نجح $ok، فشل $fail، استقرار ${ok * 100 / total}%" + (p.avgMs?.let { "، الآن %.0f ms".format(it) } ?: "، انقطاع") + sigTxt + (if (note != null) "\n⚠ $note" else "")
+                          }
+                          if (streak >= 3 && !checking) { streak = 0; runOnUiThread { runCheck() } }
+                          try { Thread.sleep(3000) } catch (e: InterruptedException) { }
+                      }
+                  }
+              }
+
+              private fun ping(host: String, count: Int = 8): PingStat = try {
+                  val p = ProcessBuilder("ping", "-c", "$count", "-i", "0.3", "-W", "2", host).redirectErrorStream(true).start()
+                  val txt = p.inputStream.bufferedReader().readText(); p.waitFor()
+                  val loss = Regex("(\\d+)% packet loss").find(txt)?.groupValues?.get(1)?.toInt() ?: 100
+                  val m = Regex("= ([\\d.]+)/([\\d.]+)/([\\d.]+)/([\\d.]+)").find(txt)?.groupValues
+                  PingStat(loss, m?.get(1)?.toDouble(), m?.get(2)?.toDouble(), m?.get(4)?.toDouble())
+              } catch (e: Exception) { PingStat(100, null, null, null) }
+
+              private fun download(): Double? = try {
+                  val c = URL("https://speed.cloudflare.com/__down?bytes=8000000").openConnection().apply { connectTimeout = 5000; readTimeout = 15000 }
+                  val t0 = System.nanoTime(); var n = 0L; val buf = ByteArray(32768)
+                  c.getInputStream().use { while (true) { val k = it.read(buf); if (k < 0) break; n += k } }
+                  n * 8 / ((System.nanoTime() - t0) / 1e9) / 1e6
+              } catch (e: Exception) { null }
+
+              private fun upload(): Double? = try {
+                  val size = 3_000_000
+                  val c = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 5000; c.readTimeout = 15000
+                  c.setFixedLengthStreamingMode(size)
+                  val buf = ByteArray(32768) { it.toByte() }
+                  val t0 = System.nanoTime()
+                  c.outputStream.use { var left = size; while (left > 0) { val k = minOf(left, buf.size); it.write(buf, 0, k); left -= k } }
+                  c.responseCode
+                  size * 8 / ((System.nanoTime() - t0) / 1e9) / 1e6
+              } catch (e: Exception) { null }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/Device.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/Device.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.net.URL
+          import java.security.KeyStore
+          import java.security.cert.X509Certificate
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+          import javax.net.ssl.*
+
+          data class DevConfig(val type: String, val ip: String, val user: String, val pass: String) {
+              val enabled get() = type != "none" && ip.isNotBlank()
+              fun save(c: Context) { c.getSharedPreferences("dev", 0).edit().putString("type", type).putString("ip", ip).putString("user", user).putString("pass_enc", Vault.enc(pass)).remove("pass").apply() }
+              companion object {
+                  fun load(c: Context): DevConfig { val p = c.getSharedPreferences("dev", 0); val enc = p.getString("pass_enc", null); val pw = if (enc != null) Vault.dec(enc) else p.getString("pass", "")!!
+                      return DevConfig(p.getString("type", "none")!!, p.getString("ip", "")!!, p.getString("user", "")!!, pw) }
+              }
+          }
+
+          /** أي حقل null = الجهاز لم يوفّره (لا نخمّن) */
+          data class DevData(
+              val reachable: Boolean, val supported: Boolean, val error: String? = null,
+              val linked: Boolean? = null, val signal: Int? = null, val noise: Int? = null, val snr: Int? = null,
+              val ethUp: Boolean? = null, val ethSpeed: Int? = null, val uptimeSec: Long? = null, val voltage: Double? = null)
+
+          /** تشفير كلمة مرور الجهاز بمفتاح AES داخل Android Keystore (لا يخرج من الهاتف) */
+          object Vault {
+              private const val ALIAS = "netcheck_key"
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+                  val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  g.init(KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
+                  return g.generateKey()
+              }
+              fun enc(s: String): String {
+                  if (s.isEmpty()) return ""
+                  val c = Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.ENCRYPT_MODE, key())
+                  return Base64.encodeToString(c.iv + c.doFinal(s.toByteArray()), Base64.NO_WRAP)
+              }
+              fun dec(s: String): String {
+                  if (s.isEmpty()) return ""
+                  return try {
+                      val b = Base64.decode(s, Base64.NO_WRAP)
+                      val c = Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, b, 0, 12))
+                      String(c.doFinal(b, 12, b.size - 12))
+                  } catch (e: Exception) { "" }
+              }
+          }
+
+          private fun num(s: String?) = s?.let { Regex("-?\\d+").find(it)?.value?.toIntOrNull() }
+
+          class DeviceReader(private val cfg: DevConfig) {
+              private val cookies = mutableMapOf<String, String>()
+
+              private fun open(ip: String, port: Int) = try { Socket().use { it.connect(InetSocketAddress(ip, port), 1500); true } } catch (e: Exception) { false }
+
+              private fun http(url: String, method: String = "GET", body: ByteArray? = null, ctype: String? = null, auth: String? = null): Pair<Int, String> {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  if (c is HttpsURLConnection) { // الأجهزة المحلية بشهادات ذاتية؛ يُطبَّق فقط على IP الجهاز الذي أدخله المستخدم
+                      val tm = arrayOf<TrustManager>(object : X509TrustManager {
+                          override fun checkClientTrusted(a: Array<X509Certificate>?, t: String?) {}
+                          override fun checkServerTrusted(a: Array<X509Certificate>?, t: String?) {}
+                          override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
+                      })
+                      val ctx = SSLContext.getInstance("TLS"); ctx.init(null, tm, null)
+                      c.sslSocketFactory = ctx.socketFactory; c.hostnameVerifier = HostnameVerifier { _, _ -> true }
+                  }
+                  c.requestMethod = method; c.connectTimeout = 4000; c.readTimeout = 6000; c.instanceFollowRedirects = false
+                  if (cookies.isNotEmpty()) c.setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                  if (auth != null) c.setRequestProperty("Authorization", auth)
+                  if (ctype != null) c.setRequestProperty("Content-Type", ctype)
+                  if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body) } }
+                  val code = c.responseCode
+                  c.headerFields["Set-Cookie"]?.forEach { sc -> val kv = sc.substringBefore(";"); if (kv.contains("=")) cookies[kv.substringBefore("=").trim()] = kv.substringAfter("=").trim() }
+                  val txt = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                  return code to txt
+              }
+
+              @Synchronized fun read(): DevData {
+                  val ip = cfg.ip
+                  val https = open(ip, 443); val plain = open(ip, 80)
+                  if (!https && !plain) return DevData(false, cfg.type == "ubiquiti" || cfg.type == "mikrotik")
+                  if (cfg.type == "other") return DevData(true, false, "هذا النوع غير مدعوم لقراءة الإشارة حالياً: يُفحص وصول الجهاز فقط")
+                  val base = (if (https) "https://" else "http://") + ip
+                  return try { if (cfg.type == "ubiquiti") ubnt(base) else mt(base) } catch (e: Exception) { DevData(true, true, "تعذّرت القراءة: ${e.message}") }
+              }
+
+              private fun ubnt(b: String): DevData {
+                  cookies.clear()
+                  http("$b/login.cgi")
+                  val bd = "----netcheck"
+                  fun part(n: String, v: String) = "--$bd\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n"
+                  val form = part("username", cfg.user) + part("password", cfg.pass) + part("uri", "/status.cgi") + "--$bd--\r\n"
+                  http("$b/login.cgi", "POST", form.toByteArray(), "multipart/form-data; boundary=$bd")
+                  var txt = http("$b/status.cgi").second
+                  if (!txt.trimStart().startsWith("{")) { // airOS الأحدث
+                      http("$b/api/auth", "POST", JSONObject().put("username", cfg.user).put("password", cfg.pass).toString().toByteArray(), "application/json")
+                      txt = http("$b/status.cgi").second
+                  }
+                  if (!txt.trimStart().startsWith("{")) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور ونوع الجهاز")
+                  val j = JSONObject(txt); val w = j.optJSONObject("wireless"); val h = j.optJSONObject("host")
+                  val sig = w?.optInt("signal", 0)?.takeIf { it != 0 }
+                  val noise = w?.optInt("noisef", 0)?.takeIf { it != 0 }
+                  val linked: Boolean? = if (w != null && w.optString("opmode") == "sta") sig != null else null
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val arr = j.optJSONArray("interfaces")
+                  if (arr != null) for (i in 0 until arr.length()) {
+                      val o = arr.optJSONObject(i) ?: continue
+                      val st = o.optJSONObject("status")
+                      if (o.optString("ifname") == "eth0" && st != null) { ethUp = st.optInt("plugged", 0) == 1; spd = st.optInt("speed", 0).takeIf { it > 0 } }
+                  }
+                  val up = h?.optLong("uptime", -1)?.takeIf { it >= 0 }
+                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null)
+              }
+
+              private fun mt(b: String): DevData {
+                  val auth = "Basic " + Base64.encodeToString("${cfg.user}:${cfg.pass}".toByteArray(), Base64.NO_WRAP)
+                  fun get(path: String) = http("$b/rest/$path", auth = auth)
+                  val probe = get("system/resource")
+                  if (probe.first == 401) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور")
+                  if (probe.first != 200) return DevData(true, true, "REST API غير متاح (يتطلب RouterOS 7.1+ مع تفعيل خدمة www)")
+                  var reg = get("interface/wifi/registration-table")
+                  if (reg.first != 200) reg = get("interface/wireless/registration-table")
+                  var linked: Boolean? = null; var sig: Int? = null; var snr: Int? = null; var noise: Int? = null
+                  if (reg.first == 200) {
+                      val a = JSONArray(reg.second); linked = a.length() > 0
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0)
+                          sig = num(o.optString("signal").ifEmpty { o.optString("signal-strength") })
+                          snr = num(o.optString("signal-to-noise")); noise = num(o.optString("noise-floor"))
+                          if (snr == null && sig != null && noise != null) snr = sig - noise
+                          if (noise == null && sig != null && snr != null) noise = sig - snr
+                      }
+                  }
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val eth = get("interface/ethernet")
+                  if (eth.first == 200) {
+                      val a = JSONArray(eth.second)
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0); ethUp = o.optString("running") == "true"
+                          val rate = o.optString("rate")
+                          spd = when { rate.contains("10Gbps") -> 10000; rate.contains("2.5Gbps") -> 2500; rate.contains("1Gbps") -> 1000; rate.contains("100Mbps") -> 100; rate.contains("10Mbps") -> 10; else -> null }
+                      }
+                  }
+                  var v: Double? = null
+                  val hl = get("system/health")
+                  if (hl.first == 200) {
+                      val t = hl.second.trim()
+                      if (t.startsWith("[")) { val a = JSONArray(t); for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("name") == "voltage") v = o.optString("value").toDoubleOrNull() } }
+                      else v = JSONObject(t).optString("voltage").toDoubleOrNull()
+                  }
+                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v)
+              }
+          }
+          NETCHECK_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetCheck-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
