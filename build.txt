@@ -1,0 +1,944 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'NETCHECK_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NetCheck"
+          include(":app")
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'NETCHECK_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'NETCHECK_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'NETCHECK_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.netcheck"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'NETCHECK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <application android:label="NET CHECK" android:allowBackup="false" android:supportsRtl="true"
+                  android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/MainActivity.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.InetAddress
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.concurrent.thread
+
+          data class Result(val title: String, val ok: Boolean?, val detail: String, val warn: Boolean = false) // ok=null => غير متاح
+          data class PingStat(val loss: Int, val minMs: Double?, val avgMs: Double?, val jitterMs: Double?)
+          data class Hop(val ip: String, val stat: PingStat)
+          data class Diag(val level: Int, val location: String, val cause: String, val fix: String) // 0 سليم، 1 تحذير، 2 عطل
+
+          private const val SEP = "\n==========\n"
+          private val cBg = Color.parseColor("#0A1426")
+          private val cCard = Color.parseColor("#14233F")
+          private val cMuted = Color.parseColor("#8FA3C7")
+          private val cText = Color.parseColor("#C7D2E8")
+          private val cMint = Color.parseColor("#34D399")
+          private val cYellow = Color.parseColor("#FACC15")
+          private val cRed = Color.parseColor("#F87171")
+          private val cOrange = Color.parseColor("#F59E0B")
+
+          class MainActivity : Activity() {
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+              private val types = arrayOf("none", "ubiquiti", "mikrotik", "other")
+
+              private lateinit var pages: List<View>
+              private lateinit var tabs: List<TextView>
+              private lateinit var badge: TextView
+              private lateinit var rxVal: TextView
+              private lateinit var rxPill: TextView
+              private lateinit var rxCap: TextView
+              private lateinit var txVal: TextView
+              private lateinit var snrVal: TextView
+              private lateinit var noiseVal: TextView
+              private lateinit var lossVal: TextView
+              private lateinit var graph: GraphView
+              private lateinit var dxHead: TextView
+              private lateinit var dxText: TextView
+              private lateinit var btn: Button
+              private lateinit var findBtn: Button
+              private lateinit var monBtn: Button
+              private lateinit var monitorView: TextView
+              private lateinit var detailsCard: LinearLayout
+              private lateinit var out: LinearLayout
+              private lateinit var histText: TextView
+              private lateinit var spType: Spinner
+              private lateinit var etIp: EditText
+              private lateinit var etUser: EditText
+              private lateinit var etPass: EditText
+              private lateinit var cfg: DevConfig
+              private var reader: DeviceReader? = null
+              @Volatile private var checking = false
+              @Volatile private var monitoring = false
+              @Volatile private var monGen = 0
+              @Volatile private var dropNote: String? = null
+              @Volatile private var lastReport = ""
+              private val histFile by lazy { File(filesDir, "history.txt") }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  cfg = DevConfig.load(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
+                  val home = buildHome(); val hist = buildHistory(); val set = buildSettings()
+                  val holder = FrameLayout(this).apply { addView(home); addView(hist); addView(set) }
+                  pages = listOf(home, hist, set)
+                  tabs = listOf("الرئيسية", "السجل", "الإعدادات").mapIndexed { i, n ->
+                      tv(n, 15f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, px(16), 0, px(16)); setOnClickListener { select(i) } }
+                  }
+                  val nav = LinearLayout(this).apply { background = bg(cCard, 0); tabs.forEach { addView(it, LinearLayout.LayoutParams(0, WRAP, 1f)) } }
+                  val rootV = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg); layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      addView(holder, LinearLayout.LayoutParams(MATCH, 0, 1f)); addView(nav, LinearLayout.LayoutParams(MATCH, WRAP))
+                  }
+                  select(0)
+                  setContentView(rootV)
+              }
+
+              // توفير البطارية: تتوقف المراقبة عند خروج التطبيق من الشاشة
+              override fun onStop() { if (monitoring) { monitoring = false; monBtn.text = "مراقبة الاستقرار" }; super.onStop() }
+
+              override fun onDestroy() { monitoring = false; super.onDestroy() }
+
+              // ---------- أدوات الواجهة ----------
+              private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+              private fun bg(color: Int, r: Int, stroke: Int = 0, sc: Int = 0) = GradientDrawable().apply {
+                  setColor(color); cornerRadius = px(r).toFloat(); if (stroke > 0) setStroke(px(stroke), sc)
+              }
+              private fun tv(t: String, size: Float, c: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(c); gravity = Gravity.START
+                  if (bold) setTypeface(null, Typeface.BOLD)
+              }
+              private fun card(): LinearLayout = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(16)); background = bg(cCard, 22)
+              }
+              private fun lp(w: Int, h: Int, weight: Float = 0f, top: Int = 0, side: Int = 0) =
+                  LinearLayout.LayoutParams(w, h, weight).apply { setMargins(px(side), px(top), px(side), 0) }
+              private fun setPill(v: TextView, t: String, c: Int) {
+                  v.text = t; v.setTextColor(c); v.background = bg(Color.argb(46, Color.red(c), Color.green(c), Color.blue(c)), 20)
+              }
+              private fun pill(t: String, c: Int) = TextView(this).apply { textSize = 14f; setPadding(px(14), px(5), px(14), px(5)); setPill(this, t, c) }
+              private fun tile(title: String, v: TextView): LinearLayout = card().apply { addView(tv(title, 14f, cMuted)); addView(v) }
+              private fun outline(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; textSize = 15f; isAllCaps = false; setTextColor(Color.WHITE); background = bg(Color.TRANSPARENT, 18, 1, cMuted)
+                  setOnClickListener { f() }
+              }
+              private fun colorOf(ok: Boolean?, warn: Boolean) = when { ok == null -> cMuted; !ok -> cRed; warn -> cYellow; else -> cMint }
+
+              private fun select(i: Int) {
+                  pages.forEachIndexed { k, p -> p.visibility = if (k == i) View.VISIBLE else View.GONE }
+                  tabs.forEachIndexed { k, t -> t.setTextColor(if (k == i) Color.WHITE else cMuted); t.setTypeface(null, if (k == i) Typeface.BOLD else Typeface.NORMAL) }
+                  if (i == 1) refreshHistory()
+              }
+
+              // ---------- الصفحة الرئيسية ----------
+              private fun buildHome(): ScrollView {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  head.addView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(tv("NET CHECK", 34f, Color.WHITE, true)); addView(tv("فاحص إشارة الإنترنت اللاسلكي", 14f, cMuted))
+                  }, lp(0, WRAP, 1f))
+                  badge = pill("غير مفحوص", cMuted)
+                  head.addView(badge)
+                  col.addView(head)
+
+                  rxVal = tv("--", 52f, cMuted, true).apply { gravity = Gravity.CENTER }
+                  rxPill = pill("غير متاح", cMuted)
+                  rxCap = tv("غير متاح: ابحث عن الصحن أو أضفه من الإعدادات", 13f, cMuted).apply { gravity = Gravity.CENTER }
+                  col.addView(card().apply {
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      addView(tv("قوة إشارة الاستقبال RX", 18f, Color.WHITE).apply { gravity = Gravity.CENTER })
+                      addView(rxVal, lp(MATCH, WRAP, top = 10))
+                      addView(rxPill, LinearLayout.LayoutParams(WRAP, WRAP).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = px(6) })
+                      addView(rxCap, lp(MATCH, WRAP, top = 12))
+                  }, lp(MATCH, WRAP, top = 16))
+
+                  txVal = tv("--", 30f, Color.WHITE, true); snrVal = tv("--", 30f, Color.WHITE, true)
+                  noiseVal = tv("--", 30f, Color.WHITE, true); lossVal = tv("--", 30f, Color.WHITE, true)
+                  col.addView(LinearLayout(this).apply {
+                      addView(tile("الإرسال TX", txVal), lp(0, WRAP, 1f, side = 5)); addView(tile("جودة الإشارة SNR", snrVal), lp(0, WRAP, 1f, side = 5))
+                  }, lp(MATCH, WRAP, top = 12))
+                  col.addView(LinearLayout(this).apply {
+                      addView(tile("التشويش Noise", noiseVal), lp(0, WRAP, 1f, side = 5)); addView(tile("فقدان الحزم", lossVal), lp(0, WRAP, 1f, side = 5))
+                  }, lp(MATCH, WRAP, top = 12))
+
+                  graph = GraphView(this)
+                  col.addView(card().apply {
+                      addView(tv("استقرار الإشارة", 20f, Color.WHITE, true))
+                      addView(graph, lp(MATCH, WRAP, top = 8))
+                      addView(tv("متابعة تغير الإشارة مع الوقت", 13f, cMuted).apply { setPadding(0, px(6), 0, 0) })
+                  }, lp(MATCH, WRAP, top = 12))
+
+                  dxHead = tv("لم يتم الفحص بعد", 22f, cMuted, true).apply { setPadding(0, px(10), 0, px(4)) }
+                  dxText = tv("اضغط «ابدأ الفحص» لتشخيص الاتصال", 14f, cMuted)
+                  col.addView(card().apply { addView(tv("التشخيص", 20f, Color.WHITE, true)); addView(dxHead); addView(dxText) }, lp(MATCH, WRAP, top = 12))
+
+                  btn = Button(this).apply {
+                      text = "ابدأ الفحص"; textSize = 22f; isAllCaps = false; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE)
+                      background = bg(cOrange, 24); setOnClickListener { runCheck() }
+                  }
+                  col.addView(btn, lp(MATCH, px(66), top = 16))
+                  findBtn = outline("بحث عن الصحن") { findDish() }
+                  monBtn = outline("مراقبة الاستقرار") { toggleMonitor() }
+                  col.addView(LinearLayout(this).apply { addView(findBtn, lp(0, px(52), 1f, side = 5)); addView(monBtn, lp(0, px(52), 1f, side = 5)) }, lp(MATCH, WRAP, top = 10))
+                  monitorView = tv("", 14f, Color.CYAN)
+                  col.addView(monitorView, lp(MATCH, WRAP, top = 8))
+
+                  out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  detailsCard = card().apply { visibility = View.GONE; addView(tv("تفاصيل الفحص", 20f, Color.WHITE, true)); addView(out) }
+                  col.addView(detailsCard, lp(MATCH, WRAP, top = 12))
+                  return ScrollView(this).apply { addView(col) }
+              }
+
+              /** لوحة الصحن: كل قيمة تُعرض فقط إذا وفّرها الجهاز فعلاً، وإلا -- */
+              private fun updateDash(d: DevData?, est: Pair<String, Int>? = null) {
+                  val sig = d?.signal
+                  val dead = d != null && (!d.reachable || d.linked == false)
+                  val (st, sc) = when {
+                      d == null -> est ?: ("غير متاح" to cMuted)
+                      dead -> "منقطع" to cRed
+                      sig == null -> est ?: ("غير متاح" to cMuted)
+                      sig >= -60 -> "ممتازة" to cMint
+                      sig >= -70 -> "جيدة جداً" to cMint
+                      sig >= -80 -> "ضعيفة" to cYellow
+                      else -> "ضعيفة جداً" to cRed
+                  }
+                  val real = sig != null && !dead
+                  rxVal.text = if (real) "$sig dBm" else "--"
+                  rxVal.setTextColor(if (real) sc else cMuted)
+                  setPill(rxPill, st, sc)
+                  rxCap.text = when {
+                      d == null -> "غير متاح: ابحث عن الصحن أو أضفه من الإعدادات"
+                      !d.reachable -> "الصحن لا يستجيب على الشبكة"
+                      d.linked == false -> "منقطع عن البرج"
+                      sig == null -> (d.error ?: "غير متاح: الجهاز لا يوفّر قراءة الإشارة") + (est?.let { " — تقدير غير مباشر لرابط الصحن: ${it.first}" } ?: "")
+                      else -> (if (d.linked == true) "مرتبط بالبرج · " else "") + "قراءة حقيقية من جهاز الصحن"
+                  }
+                  txVal.text = d?.txPower?.let { "$it dBm" } ?: "--"
+                  snrVal.text = d?.snr?.let { "$it dB" } ?: "--"
+                  noiseVal.text = d?.noise?.let { "$it dBm" } ?: "--"
+                  if (sig != null && !dead) graph.add(sig)
+              }
+
+              // ---------- السجل ----------
+              private fun buildHistory(): ScrollView {
+                  histText = tv("", 14f, cText)
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  col.addView(tv("السجل", 30f, Color.WHITE, true))
+                  col.addView(card().apply { addView(histText) }, lp(MATCH, WRAP, top = 12))
+                  col.addView(outline("مشاركة آخر تقرير") { share() }, lp(MATCH, px(52), top = 12))
+                  col.addView(outline("مسح السجل") { histFile.delete(); refreshHistory() }, lp(MATCH, px(52), top = 8))
+                  return ScrollView(this).apply { addView(col) }
+              }
+              private fun refreshHistory() { val t = if (histFile.exists()) histFile.readText() else ""; histText.text = if (t.isBlank()) "لا يوجد سجل بعد" else t }
+
+              private fun share() {
+                  val rep = if (lastReport.isNotBlank()) lastReport else (if (histFile.exists()) histFile.readText().split(SEP).firstOrNull() ?: "" else "")
+                  if (rep.isBlank()) { toast("أجرِ فحصاً أولاً"); return }
+                  startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, rep) }, "مشاركة التقرير"))
+              }
+
+              private fun saveHistory(rep: String) {
+                  try {
+                      val old = (if (histFile.exists()) histFile.readText() else "").split(SEP).filter { it.isNotBlank() }
+                      histFile.writeText((listOf(rep) + old).take(30).joinToString(SEP)) // الأحدث أولاً
+                  } catch (e: Exception) { }
+              }
+
+              // ---------- الإعدادات ----------
+              private fun edit(h: String, pw: Boolean = false) = EditText(this).apply {
+                  hint = h; setTextColor(Color.WHITE); setHintTextColor(cMuted)
+                  inputType = if (pw) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_CLASS_TEXT
+              }
+              private fun field(label: String, v: View): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(tv(label, 13f, cMuted)); addView(v) }
+
+              private fun buildSettings(): ScrollView {
+                  spType = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, arrayOf("بدون جهاز", "Ubiquiti (airOS)", "MikroTik (RouterOS 7)", "أخرى / TP-Link (فحص الوصول فقط)"))
+                  }
+                  etIp = edit("192.168.1.20"); etUser = edit("اسم المستخدم"); etPass = edit("كلمة المرور", true)
+                  fillSettings()
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  col.addView(tv("الإعدادات", 30f, Color.WHITE, true))
+                  col.addView(card().apply {
+                      addView(tv("جهاز الصحن", 18f, Color.WHITE, true))
+                      addView(field("النوع", spType), lp(MATCH, WRAP, top = 10)); addView(field("عنوان IP", etIp), lp(MATCH, WRAP, top = 10))
+                      addView(field("اسم المستخدم", etUser), lp(MATCH, WRAP, top = 10)); addView(field("كلمة المرور", etPass), lp(MATCH, WRAP, top = 10))
+                  }, lp(MATCH, WRAP, top = 12))
+                  col.addView(Button(this).apply {
+                      text = "حفظ"; textSize = 20f; isAllCaps = false; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE)
+                      background = bg(cOrange, 24); setOnClickListener { saveSettings() }
+                  }, lp(MATCH, px(58), top = 16))
+                  col.addView(outline("بحث عن الصحن") { findDish() }, lp(MATCH, px(52), top = 10))
+                  col.addView(outline("إعادة البحث التلقائي") { getSharedPreferences("auto", 0).edit().clear().apply(); toast("تم مسح العنوان المحفوظ") }, lp(MATCH, px(52), top = 8))
+                  col.addView(tv("كلمة مرور الجهاز تُحفظ مشفّرة على هاتفك فقط.", 12f, cMuted), lp(MATCH, WRAP, top = 12))
+                  return ScrollView(this).apply { addView(col) }
+              }
+              private fun fillSettings() { spType.setSelection(types.indexOf(cfg.type).coerceAtLeast(0)); etIp.setText(cfg.ip); etUser.setText(cfg.user); etPass.setText(cfg.pass) }
+              private fun saveSettings() {
+                  cfg = DevConfig(types[spType.selectedItemPosition], etIp.text.toString().trim(), etUser.text.toString().trim(), etPass.text.toString())
+                  cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
+                  toast("تم الحفظ")
+              }
+
+              // ---------- زر: بحث عن الصحن ----------
+              private fun ipStr(x: Int) = "${x and 255}.${x shr 8 and 255}.${x shr 16 and 255}.${x shr 24 and 255}"
+              private fun kindName(k: String) = when (k) { "ubiquiti" -> "Ubiquiti"; "mikrotik" -> "MikroTik"; else -> "TP-Link / غير معروف" }
+
+              private fun findDish() {
+                  val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  @Suppress("DEPRECATION") val dh = wm.dhcpInfo
+                  val gw = dh?.gateway ?: 0
+                  if (gw == 0) { toast("اتصل بشبكة Wi-Fi الخاصة بالراوتر أولاً"); return }
+                  val gwIp = ipStr(gw); val me = ipStr(dh?.ipAddress ?: 0)
+                  val wait = AlertDialog.Builder(this).setTitle("بحث عن الصحن").setMessage("جاري البحث في شبكة الراوتر $gwIp ...").setCancelable(false).show()
+                  thread {
+                      val found = try { Scanner.findAll(gwIp, me) } catch (e: Exception) { emptyList() }
+                      runOnUiThread { wait.dismiss(); onFound(found) }
+                  }
+              }
+
+              private fun onFound(list: List<Found>) {
+                  if (list.isEmpty()) {
+                      AlertDialog.Builder(this).setTitle("لم يُعثر على الصحن")
+                          .setMessage("لم يُكتشف جهاز صحن في شبكة الراوتر تلقائياً (قد يكون على نطاق IP مختلف). أضف عنوانه يدوياً من «الإعدادات».")
+                          .setPositiveButton("فتح الإعدادات") { _, _ -> select(2) }.setNegativeButton("إغلاق", null).show()
+                      return
+                  }
+                  if (list.size == 1) askCreds(list[0])
+                  else AlertDialog.Builder(this).setTitle("اختر الصحن")
+                      .setItems(list.map { "${it.ip}  (${kindName(it.kind)})" }.toTypedArray()) { _, i -> askCreds(list[i]) }.show()
+              }
+
+              private fun askCreds(f: Found) {
+                  if (f.kind == "other") {
+                      cfg = DevConfig("other", f.ip, "", ""); cfg.save(this); reader = DeviceReader(cfg); fillSettings()
+                      AlertDialog.Builder(this).setTitle("تم العثور على جهاز")
+                          .setMessage("عُثر على جهاز في ${f.ip} لكن نوعه غير مدعوم لقراءة الإشارة، وسيُفحص وصوله فقط.").setPositiveButton("حسناً", null).show()
+                      return
+                  }
+                  val us = edit("اسم المستخدم"); val pw = edit("كلمة المرور", true)
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(20), px(8), px(20), 0); addView(us); addView(pw) }
+                  AlertDialog.Builder(this).setTitle("تم العثور على الصحن")
+                      .setMessage("${f.ip} (${kindName(f.kind)})\nأدخل اسم المستخدم وكلمة المرور الخاصة بجهازك ليقرأ التطبيق قوة الإشارة.").setView(box)
+                      .setPositiveButton("حفظ وقراءة") { _, _ ->
+                          cfg = DevConfig(f.kind, f.ip, us.text.toString().trim(), pw.text.toString())
+                          cfg.save(this); reader = DeviceReader(cfg); fillSettings(); readNow()
+                      }.setNegativeButton("إلغاء", null).show()
+              }
+
+              private fun readNow() {
+                  thread {
+                      val d = try { (reader ?: DeviceReader(cfg).also { reader = it }).read() } catch (e: Exception) { null }
+                      runOnUiThread {
+                          updateDash(d)
+                          if (d == null) toast("تعذّرت القراءة")
+                          else if (d.error != null) toast(d.error)
+                          else if (d.signal == null) toast("الجهاز لم يوفّر قراءة الإشارة")
+                      }
+                  }
+              }
+
+              /** يستعمل عنوان الصحن المحفوظ لنفس الراوتر، وإلا يبحث عنه في شبكة الراوتر ثم يحفظه */
+              private fun autoDish(gwIp: String, meInt: Int): DevConfig? {
+                  val p = getSharedPreferences("auto", 0)
+                  val saved = if (p.getString("gw", null) == gwIp) p.getString("ip", null) else null
+                  if (saved != null) return DevConfig("other", saved, "", "")
+                  val me = if (meInt != 0) "${meInt and 255}.${meInt shr 8 and 255}.${meInt shr 16 and 255}.${meInt shr 24 and 255}" else null
+                  val found = Scanner.find(gwIp, me) ?: return null
+                  p.edit().putString("gw", gwIp).putString("ip", found).apply()
+                  return DevConfig("other", found, "", "")
+              }
+              // ---------- المرحلة 3: الصحن والكيبل ----------
+              private fun fmtUp(s: Long) = "${s / 86400}d ${s % 86400 / 3600}h ${s % 3600 / 60}m"
+
+              private fun devResults(d: DevData?, c: DevConfig = cfg): List<Result> {
+                  val none = "غير متاح: لم يُعثر على الصحن تلقائياً في شبكة الراوتر. أضف عنوانه من «إعدادات الجهاز»."
+                  if (d == null) return listOf("إشارة الصحن (dBm)", "Noise و SNR", "كيبل الصحن ومحوّل PoE", "Ethernet بين PoE والراوتر", "الكهرباء والتغذية").map { Result(it, null, none) }
+                  if (!d.reachable) return listOf(
+                      Result("إشارة الصحن (dBm)", false, "الصحن لا يستجيب على ${c.ip}: لا يمكن قراءة الإشارة"),
+                      Result("Noise و SNR", null, "غير متاح: الصحن لا يستجيب"),
+                      Result("كيبل الصحن ومحوّل PoE", false, "الصحن لا يستجيب على الشبكة: كيبل أو PoE أو كهرباء (محتمل)"),
+                      Result("Ethernet بين PoE والراوتر", null, "غير متاح: الصحن لا يستجيب"),
+                      Result("الكهرباء والتغذية", null, "غير متاح: الصحن لا يستجيب"))
+                  val na = d.error ?: "غير متاح: الجهاز لا يدعم قراءة هذه البيانات"
+                  val l = mutableListOf<Result>()
+                  l += when {
+                      d.linked == false -> Result("إشارة الصحن (dBm)", false, "منقطعة: الصحن غير مرتبط بالبرج")
+                      d.signal != null -> {
+                          val s: Int = d.signal
+                          val txt = if (s >= -70) "قوية" else if (s >= -80) "ضعيفة" else "ضعيفة جداً"
+                          Result("إشارة الصحن (dBm)", s >= -80, "$s dBm: $txt", s in -80..-71)
+                      }
+                      else -> Result("إشارة الصحن (dBm)", null, na)
+                  }
+                  l += if (d.snr != null) {
+                      val q: Int = d.snr
+                      Result("Noise و SNR", q >= 15, "SNR $q dB" + (d.noise?.let { "، Noise $it dBm" } ?: "") + ": " + (if (q >= 25) "جيد" else if (q >= 15) "متوسط" else "ضعيف"), q in 15..24)
+                  } else Result("Noise و SNR", null, na)
+                  l += Result("كيبل الصحن ومحوّل PoE", true, "الصحن يستجيب عبر الشبكة، ما يدل على وصول التغذية والكيبل (لا يُفحص السلك كهربائياً)")
+                  l += when {
+                      d.ethUp == false -> Result("Ethernet بين PoE والراوتر", false, "المنفذ غير موصول (Link down)")
+                      d.ethUp == true -> {
+                          val sp = d.ethSpeed
+                          Result("Ethernet بين PoE والراوتر", true, "متصل" + (sp?.let { "، سرعة المنفذ $it Mbps" } ?: "") + (if (sp != null && sp <= 10) ": سرعة منخفضة قد تدل على كيبل تالف" else ""), sp != null && sp <= 10)
+                      }
+                      else -> Result("Ethernet بين PoE والراوتر", null, na)
+                  }
+                  val bits = mutableListOf<String>(); var warn = false
+                  d.voltage?.let { bits += "الجهد %.1f V".format(it) }
+                  d.uptimeSec?.let { bits += "مدة التشغيل " + fmtUp(it); if (it < 300) warn = true }
+                  l += if (bits.isEmpty()) Result("الكهرباء والتغذية", null, "غير متاح: الجهاز لا يوفّر بيانات الكهرباء")
+                  else Result("الكهرباء والتغذية", true, bits.joinToString("، ") + (if (warn) ": أُعيد تشغيله حديثاً (قد يدل على انقطاع كهرباء)" else ""), warn)
+                  return l
+              }
+
+              // ---------- المرحلة 4: التشخيص الذكي ----------
+              private fun diagnose(d: DevData?, gwIp: String?, routerOk: Boolean, netUp: Boolean, dnsOk: Boolean, poor: Boolean, drop: String?): Diag {
+                  val sig = d?.signal; val snr = d?.snr
+                  val dishGood = d != null && d.reachable && sig != null && sig >= -70 && (snr == null || snr >= 25) && d.linked != false
+                  return when {
+                      gwIp == null -> Diag(2, "الهاتف / Wi-Fi", "الهاتف غير متصل بشبكة Wi-Fi", "فعّل Wi-Fi واتصل بشبكة الراوتر ثم أعد الفحص")
+                      !routerOk -> Diag(2, "الراوتر", "الراوتر لا يستجيب (ضعف Wi-Fi أو تعليق)", "قرّب الهاتف من الراوتر، أعد تشغيله، وافحص كيبل PoE بين المحوّل والراوتر")
+                      d != null && !d.reachable -> Diag(2, "كيبل الصحن / محوّل PoE / الكهرباء", "الراوتر يعمل لكن الصحن لا يستجيب على الشبكة", "تأكد من إضاءة محوّل PoE، ثبّت قوابس الكيبل، وجرّب كيبل أو محوّل PoE آخر")
+                      d?.ethUp == false -> Diag(2, "كيبل Ethernet بين PoE والراوتر", "منفذ Ethernet في الصحن غير موصول", "افحص الكيبل من المحوّل إلى الصحن وإلى الراوتر، وبدّل القوابس التالفة")
+                      d?.linked == false -> Diag(2, "الصحن / البرج", "الصحن يعمل لكنه غير مرتبط بالبرج", "افحص اتجاه الصحن ووجود عوائق، ثم اتصل بالمزود")
+                      (sig != null && sig < -80) || (snr != null && snr < 15) -> Diag(2, "إشارة الصحن", "إشارة ضعيفة جداً" + (if (drop != null) "، مع انخفاض مفاجئ: احتمال تحرك الصحن" else ""), "أعد توجيه الصحن نحو البرج وأزل العوائق وافحص قوابس الكيبل")
+                      !netUp && d != null && d.reachable && sig == null -> Diag(2, "البرج أو المزود أو اتجاه الصحن", "الراوتر والصحن يستجيبان (الكيبل وPoE يعملان) لكن لا يوجد إنترنت، وإشارة الصحن غير مقروءة", "اتصل بالمزود وأبلغه، وافحص اتجاه الصحن وعوائق أمامه")
+                      !netUp -> if (dishGood) Diag(2, "البرج / مزود الإنترنت", "الصحن والإشارة سليمان لكن لا يوجد إنترنت", "اتصل بمزود الإنترنت وأبلغه بالانقطاع")
+                          else Diag(2, "غير محدد: الصحن أو الكيبل أو PoE أو البرج أو المزود", "الراوتر يعمل لكن لا يوجد إنترنت، ولا تتوفر بيانات الصحن لتحديد الموضع", "أضف جهاز الصحن من «إعدادات الجهاز» لتحديد دقيق، وافحص إضاءة PoE")
+                      !dnsOk -> Diag(2, "DNS", "الإنترنت يعمل لكن DNS لا يعمل", "غيّر DNS في الراوتر إلى 1.1.1.1 أو 8.8.8.8")
+                      drop != null -> Diag(1, "إشارة الصحن", "انخفاض مفاجئ في الإشارة: احتمال تحرك الصحن أو عائق جديد", "افحص اتجاه الصحن وثباته على الصاري")
+                      (sig != null && sig < -70) || (snr != null && snr < 25) -> Diag(1, "إشارة الصحن", "الإشارة ضعيفة نسبياً وقد تسبب بطئاً", "حسّن توجيه الصحن وأزل العوائق")
+                      poor -> if (dishGood) Diag(1, "البرج / مزود الإنترنت", "الصحن سليم لكن الجودة ضعيفة: ازدحام أو مشكلة عند المزود", "جرّب في وقت آخر أو اتصل بالمزود")
+                          else Diag(1, "غير محدد", "جودة الاتصال ضعيفة (بطء/بنغ/فقدان حزم)", "أضف جهاز الصحن من «إعدادات الجهاز» لتحديد السبب بدقة")
+                      else -> Diag(0, "لا يوجد عطل", "لم يُكتشف عطل في الأجزاء التي أمكن فحصها", "لا حاجة لإجراء")
+                  }
+              }
+
+              // ---------- الفحص الكامل ----------
+              private fun runCheck() {
+                  if (checking) return
+                  checking = true
+                  btn.isEnabled = false; out.removeAllViews(); dxHead.text = "جاري الفحص..."; dxHead.setTextColor(cYellow); dxText.text = "قد يستغرق الفحص نصف دقيقة"; dxText.setTextColor(cMuted)
+                  thread { try {
+                      val r = mutableListOf<Result>()
+                      val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                      @Suppress("DEPRECATION") val info = wm.connectionInfo
+                      @Suppress("DEPRECATION") val dh = wm.dhcpInfo
+                      val gw = dh?.gateway ?: 0
+                      val gwIp = if (gw != 0) "${gw and 255}.${gw shr 8 and 255}.${gw shr 16 and 255}.${gw shr 24 and 255}" else null
+                      // إذا لم يُضف جهاز يدوياً: يبحث التطبيق عن الصحن تلقائياً (ويحفظ عنوانه لنفس الراوتر)
+                      val autoCfg: DevConfig? = if (cfg.enabled || gwIp == null) null else autoDish(gwIp, dh?.ipAddress ?: 0)
+                      val d: DevData? = if (cfg.enabled) (reader ?: DeviceReader(cfg).also { reader = it }).read() else autoCfg?.let { DeviceReader(it).read() }
+                      r += devResults(d, if (cfg.enabled) cfg else (autoCfg ?: cfg))
+                      val dn = dropNote
+                      r += when {
+                          dn != null -> Result("تغيّر الإشارة", false, dn)
+                          monitoring && cfg.enabled -> Result("تغيّر الإشارة", true, "لا انخفاض مفاجئ أثناء المراقبة")
+                          else -> Result("تغيّر الإشارة", null, "غير متاح: شغّل «مراقبة الاستقرار» مع جهاز صحن مُضاف")
+                      }
+
+                      val gwPing = gwIp?.let { ping(it) }
+                      val routerOk = gwPing != null && gwPing.loss < 100
+                      r += Result("1. اتصال الهاتف بالراوتر", if (gwIp == null) false else routerOk,
+                          if (gwIp == null) "غير متصل بشبكة Wi-Fi" else "Wi-Fi ${info.rssi} dBm، سرعة الربط ${info.linkSpeed} Mbps، فقدان حزم للراوتر ${gwPing?.loss}%")
+                      r += Result("2. عنوان Gateway IP", gwIp != null, gwIp ?: "غير معروف")
+
+                      val p1 = ping("1.1.1.1"); val p2 = ping("8.8.8.8")
+                      val best = listOf(p1, p2).minByOrNull { it.loss }!!
+                      val netUp = best.loss < 100
+                      r += Result("3. اتصال الإنترنت الخارجي", netUp, if (netUp) "يعمل" else "لا يوجد رد من 1.1.1.1 و8.8.8.8")
+                      val pingR = Result("4. Ping و Latency", netUp && (best.avgMs ?: 999.0) < 200,
+                          if (!netUp) "غير متاح" else "أدنى %.0f ms، متوسط %.0f ms، Jitter %.1f ms".format(best.minMs ?: 0.0, best.avgMs ?: 0.0, best.jitterMs ?: 0.0), netUp && (best.avgMs ?: 999.0) >= 100)
+                      val lossR = Result("5. Packet Loss", netUp && best.loss <= 10, "${best.loss}%", netUp && best.loss > 2)
+                      val t0 = System.nanoTime()
+                      val dnsOk = try { InetAddress.getByName("google.com"); true } catch (e: Exception) { false }
+                      val dnsMs = (System.nanoTime() - t0) / 1_000_000
+                      val dnsR = Result("6. DNS", dnsOk, if (dnsOk) "يعمل (${dnsMs} ms)" else "لا يعمل", dnsOk && dnsMs > 300)
+                      val down = if (netUp) download() else null
+                      val up = if (netUp) upload() else null
+                      val speedR = Result("7. سرعة Download و Upload", down != null && up != null && down >= 1 && up >= 0.5,
+                          "تنزيل: ${down?.let { "%.1f Mbps".format(it) } ?: "فشل"}، رفع: ${up?.let { "%.1f Mbps".format(it) } ?: "فشل"}", down != null && up != null && (down < 5 || up < 1))
+                      r += listOf(pingR, lossR, dnsR, speedR)
+                      val hops = if (netUp) findHops("1.1.1.1", gwIp) else emptyList()
+                      val (linkRes, est) = linkEstimate(hops, netUp)
+                      r += linkRes
+
+                      val poor = netUp && listOf(pingR, lossR, speedR).any { it.ok == false || it.warn }
+                      val dg = diagnose(d, gwIp, routerOk, netUp, dnsOk, poor, dn)
+                      val time = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+                      val rep = buildString {
+                          appendLine("NET CHECK - $time")
+                          r.forEach { appendLine((when { it.ok == null -> "⚪"; it.ok == false -> "🔴"; it.warn -> "🟡"; else -> "🟢" }) + " ${it.title}: ${it.detail}") }
+                          appendLine(); appendLine("مكان العطل: ${dg.location}"); appendLine("السبب: ${dg.cause}"); append("الحل المقترح: ${dg.fix}")
+                      }
+                      lastReport = rep; saveHistory(rep)
+                      runOnUiThread {
+                          updateDash(d, est)
+                          lossVal.text = if (netUp) "${best.loss}%" else "--"
+                          setPill(badge, if (netUp) "متصل" else "منقطع", if (netUp) cMint else cRed)
+                          dxHead.text = dg.location
+                          dxHead.setTextColor(when (dg.level) { 0 -> cMint; 1 -> cYellow; else -> cRed })
+                          dxText.text = "السبب: ${dg.cause}\nالحل المقترح: ${dg.fix}"; dxText.setTextColor(cText)
+                          detailsCard.visibility = View.VISIBLE
+                          r.forEach { x ->
+                              out.addView(tv(x.title, 16f, colorOf(x.ok, x.warn), true).apply { setPadding(0, px(12), 0, 0) })
+                              out.addView(tv(x.detail, 14f, cText))
+                          }
+                          btn.isEnabled = true; btn.text = "إعادة الفحص"
+                      }
+                  } catch (e: Exception) {
+                      runOnUiThread { dxHead.text = "تعذّر إكمال الفحص"; dxHead.setTextColor(cRed); dxText.text = e.message ?: ""; btn.isEnabled = true }
+                  } finally { checking = false }
+                  }
+              }
+
+              /** مراقبة الاستقرار: ping كل 3 ثوان + قراءة الإشارة إن وُجد جهاز. 3 إخفاقات متتالية = إعادة فحص تلقائي */
+              private fun toggleMonitor() {
+                  if (monitoring) { monitoring = false; monBtn.text = "مراقبة الاستقرار"; return }
+                  monitoring = true; dropNote = null; monBtn.text = "إيقاف المراقبة"
+                  val gen = ++monGen
+                  thread {
+                      var ok = 0; var fail = 0; var streak = 0
+                      var prev: Int? = null; var max: Int? = null
+                      while (monitoring && gen == monGen) {
+                          val p = ping("1.1.1.1", 1)
+                          if (p.loss < 100) { ok++; streak = 0 } else { fail++; streak++ }
+                          var sigTxt = ""; var devNow: DevData? = null
+                          if (cfg.enabled) {
+                              val dd = try { (reader ?: DeviceReader(cfg).also { reader = it }).read() } catch (e: Exception) { null }
+                              devNow = dd
+                              val sig = dd?.signal
+                              if (sig != null) {
+                                  sigTxt = "، الإشارة $sig dBm"
+                                  val pv = prev; val mx = max
+                                  if (dropNote == null && ((pv != null && sig <= pv - 10) || (mx != null && sig <= mx - 10)))
+                                      dropNote = "انخفضت الإشارة فجأة إلى $sig dBm (كانت ${pv ?: mx} dBm): قد يدل على تحرك الصحن أو عائق"
+                                  prev = sig; max = if (mx == null || sig > mx) sig else mx
+                              }
+                          }
+                          val total = ok + fail
+                          val note = dropNote
+                          val dv = devNow
+                          runOnUiThread {
+                              monitorView.text = "المراقبة: نجح $ok، فشل $fail، استقرار ${ok * 100 / total}%" + (p.avgMs?.let { "، الآن %.0f ms".format(it) } ?: "، انقطاع") + sigTxt + (if (note != null) "\n⚠ $note" else "")
+                              if (dv != null) updateDash(dv)
+                          }
+                          if (streak >= 3 && !checking) { streak = 0; runOnUiThread { runCheck() } }
+                          try { Thread.sleep(3000) } catch (e: InterruptedException) { }
+                      }
+                  }
+              }
+
+              /** يجد عنوان أول نقاط بعد الراوتر عبر ping بقيمة TTL صغيرة (بدون أي دخول للصحن) */
+              private fun hopIp(target: String, ttl: Int): String? = try {
+                  val p = ProcessBuilder("ping", "-c", "1", "-W", "2", "-t", "$ttl", target).redirectErrorStream(true).start()
+                  val txt = p.inputStream.bufferedReader().readText(); p.waitFor()
+                  Regex("[Ff]rom ([\\d.]+)").find(txt)?.groupValues?.get(1)
+              } catch (e: Exception) { null }
+
+              private fun findHops(target: String, gw: String?): List<Hop> {
+                  val seen = mutableListOf<String>()
+                  for (ttl in 2..4) {
+                      val ip = hopIp(target, ttl) ?: continue
+                      if (ip == target) break
+                      if (ip == gw || ip in seen) continue
+                      seen += ip
+                  }
+                  return seen.take(2).map { Hop(it, ping(it, 6)) }
+              }
+
+              /** تقدير غير مباشر لجودة رابط الصحن مع البرج من تأخير وJitter وفقدان أول نقطة بعد الراوتر (ليس dBm) */
+              private fun linkEstimate(hops: List<Hop>, netUp: Boolean): Pair<Result, Pair<String, Int>?> {
+                  val title = "جودة رابط الصحن مع البرج (تقدير غير مباشر)"
+                  if (!netUp) return Result(title, null, "غير متاح: لا يوجد إنترنت للقياس") to null
+                  val h = hops.firstOrNull() ?: return Result(title, null, "غير متاح: تعذّر تحديد أول نقطة بعد الراوتر (قد تحجب الأجهزة ردود ping)") to null
+                  val s = h.stat
+                  if (s.loss >= 100) return Result(title, null, "غير متاح: أول نقطة بعد الراوتر (${h.ip}) لا ترد على ping") to null
+                  val avg = s.avgMs ?: 0.0; val jit = s.jitterMs ?: 0.0
+                  val bad = s.loss > 5 || jit > 20 || avg > 60
+                  val mid = !bad && (s.loss > 1 || jit > 8 || avg > 25)
+                  val word = if (bad) "ضعيف" else if (mid) "متوسط" else "جيد"
+                  val txt = "%s: تأخير %.0f ms، Jitter %.1f ms، فقدان %d%%: %s (تقدير من التأخير وليس قراءة dBm)".format(h.ip, avg, jit, s.loss, word)
+                  val col = if (bad) Color.RED else if (mid) Color.YELLOW else Color.GREEN
+                  return Result(title, !bad, txt, mid) to ("$word (تقدير)" to col)
+              }
+
+              private fun ping(host: String, count: Int = 8): PingStat = try {
+                  val p = ProcessBuilder("ping", "-c", "$count", "-i", "0.3", "-W", "2", host).redirectErrorStream(true).start()
+                  val txt = p.inputStream.bufferedReader().readText(); p.waitFor()
+                  val loss = Regex("(\\d+)% packet loss").find(txt)?.groupValues?.get(1)?.toInt() ?: 100
+                  val m = Regex("= ([\\d.]+)/([\\d.]+)/([\\d.]+)/([\\d.]+)").find(txt)?.groupValues
+                  PingStat(loss, m?.get(1)?.toDouble(), m?.get(2)?.toDouble(), m?.get(4)?.toDouble())
+              } catch (e: Exception) { PingStat(100, null, null, null) }
+
+              private fun download(): Double? = try {
+                  val c = URL("https://speed.cloudflare.com/__down?bytes=8000000").openConnection().apply { connectTimeout = 5000; readTimeout = 15000 }
+                  val t0 = System.nanoTime(); var n = 0L; val buf = ByteArray(32768)
+                  c.getInputStream().use { while (true) { val k = it.read(buf); if (k < 0) break; n += k } }
+                  n * 8 / ((System.nanoTime() - t0) / 1e9) / 1e6
+              } catch (e: Exception) { null }
+
+              private fun upload(): Double? = try {
+                  val size = 3_000_000
+                  val c = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 5000; c.readTimeout = 15000
+                  c.setFixedLengthStreamingMode(size)
+                  val buf = ByteArray(32768) { it.toByte() }
+                  val t0 = System.nanoTime()
+                  c.outputStream.use { var left = size; while (left > 0) { val k = minOf(left, buf.size); it.write(buf, 0, k); left -= k } }
+                  c.responseCode
+                  size * 8 / ((System.nanoTime() - t0) / 1e9) / 1e6
+              } catch (e: Exception) { null }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/Device.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/Device.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.net.URL
+          import java.security.KeyStore
+          import java.security.cert.X509Certificate
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+          import javax.net.ssl.*
+
+          data class DevConfig(val type: String, val ip: String, val user: String, val pass: String) {
+              val enabled get() = type != "none" && ip.isNotBlank()
+              fun save(c: Context) { c.getSharedPreferences("dev", 0).edit().putString("type", type).putString("ip", ip).putString("user", user).putString("pass_enc", Vault.enc(pass)).remove("pass").apply() }
+              companion object {
+                  fun load(c: Context): DevConfig { val p = c.getSharedPreferences("dev", 0); val enc = p.getString("pass_enc", null); val pw = if (enc != null) Vault.dec(enc) else p.getString("pass", "")!!
+                      return DevConfig(p.getString("type", "none")!!, p.getString("ip", "")!!, p.getString("user", "")!!, pw) }
+              }
+          }
+
+          /** أي حقل null = الجهاز لم يوفّره (لا نخمّن) */
+          data class DevData(
+              val reachable: Boolean, val supported: Boolean, val error: String? = null,
+              val linked: Boolean? = null, val signal: Int? = null, val noise: Int? = null, val snr: Int? = null,
+              val ethUp: Boolean? = null, val ethSpeed: Int? = null, val uptimeSec: Long? = null, val voltage: Double? = null,
+              val txPower: Int? = null)
+
+          /** تشفير كلمة مرور الجهاز بمفتاح AES داخل Android Keystore (لا يخرج من الهاتف) */
+          object Vault {
+              private const val ALIAS = "netcheck_key"
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+                  val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  g.init(KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
+                  return g.generateKey()
+              }
+              fun enc(s: String): String {
+                  if (s.isEmpty()) return ""
+                  val c = Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.ENCRYPT_MODE, key())
+                  return Base64.encodeToString(c.iv + c.doFinal(s.toByteArray()), Base64.NO_WRAP)
+              }
+              fun dec(s: String): String {
+                  if (s.isEmpty()) return ""
+                  return try {
+                      val b = Base64.decode(s, Base64.NO_WRAP)
+                      val c = Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, b, 0, 12))
+                      String(c.doFinal(b, 12, b.size - 12))
+                  } catch (e: Exception) { "" }
+              }
+          }
+
+          private fun num(s: String?) = s?.let { Regex("-?\\d+").find(it)?.value?.toIntOrNull() }
+
+          /** الأجهزة المحلية بشهادات ذاتية: يُتجاوز التحقق من الشهادة فقط للعناوين المحلية (192.168 / 10 / 172.16-31) */
+          private fun relax(c: HttpURLConnection) {
+              if (c !is HttpsURLConnection) return
+              val h = c.url.host
+              if (!(h.startsWith("192.168.") || h.startsWith("10.") || Regex("^172\\.(1[6-9]|2\\d|3[01])\\.").containsMatchIn(h))) return
+              val tm = arrayOf<TrustManager>(object : X509TrustManager {
+                  override fun checkClientTrusted(a: Array<X509Certificate>?, t: String?) {}
+                  override fun checkServerTrusted(a: Array<X509Certificate>?, t: String?) {}
+                  override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
+              })
+              val ctx = SSLContext.getInstance("TLS"); ctx.init(null, tm, null)
+              c.sslSocketFactory = ctx.socketFactory; c.hostnameVerifier = HostnameVerifier { _, _ -> true }
+          }
+
+          data class Found(val ip: String, val kind: String) // kind: ubiquiti | mikrotik | other
+
+          /** اكتشاف الصحن داخل شبكة الراوتر (نفس النطاق /24) بدون أي كلمة مرور: يتعرف عليه من صفحة الدخول أو منفذ Winbox */
+          object Scanner {
+              private val ubnt = listOf("airos", "ubiquiti", "ubnt", "airmax", "nanostation", "litebeam", "powerbeam", "nanobeam")
+              private val mtik = listOf("routeros", "mikrotik")
+              private val tpl = listOf("tp-link", "tplink")
+
+              private fun portOpen(h: String, port: Int, ms: Int) = try { Socket().use { it.connect(InetSocketAddress(h, port), ms); true } } catch (e: Exception) { false }
+
+              private fun look(url: String): String = try {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  relax(c); c.connectTimeout = 1000; c.readTimeout = 1500; c.instanceFollowRedirects = false
+                  val code = c.responseCode
+                  val head = c.headerFields.entries.joinToString(" ") { (it.key ?: "") + " " + it.value.joinToString(" ") }
+                  val body = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { r -> val b = CharArray(4000); val n = r.read(b); if (n > 0) String(b, 0, n) else "" } ?: ""
+                  (head + " " + body).lowercase()
+              } catch (e: Exception) { "" }
+
+              private fun probe(h: String): String? {
+                  if (portOpen(h, 8291, 300)) return "mikrotik"
+                  val txt = (if (portOpen(h, 80, 400)) look("http://$h/") else "") + " " + (if (portOpen(h, 443, 400)) look("https://$h/") else "")
+                  return when {
+                      ubnt.any { txt.contains(it) } -> "ubiquiti"
+                      mtik.any { txt.contains(it) } -> "mikrotik"
+                      tpl.any { txt.contains(it) } -> "other"
+                      else -> null
+                  }
+              }
+
+              fun findAll(gw: String, me: String?): List<Found> {
+                  val base = gw.substringBeforeLast(".") + "."
+                  val found = java.util.concurrent.ConcurrentLinkedQueue<Found>()
+                  val pool = java.util.concurrent.Executors.newFixedThreadPool(48)
+                  for (i in 1..254) { val h = base + i; if (h != gw && h != me) pool.execute { val k = probe(h); if (k != null) found.add(Found(h, k)) } }
+                  pool.shutdown()
+                  pool.awaitTermination(25, java.util.concurrent.TimeUnit.SECONDS)
+                  pool.shutdownNow()
+                  return found.sortedBy { it.ip.substringAfterLast(".").toInt() }
+              }
+
+              fun find(gw: String, me: String?): String? = findAll(gw, me).firstOrNull()?.ip
+          }
+
+          class DeviceReader(private val cfg: DevConfig) {
+              private val cookies = mutableMapOf<String, String>()
+
+              private fun open(ip: String, port: Int) = try { Socket().use { it.connect(InetSocketAddress(ip, port), 1500); true } } catch (e: Exception) { false }
+
+              private fun http(url: String, method: String = "GET", body: ByteArray? = null, ctype: String? = null, auth: String? = null): Pair<Int, String> {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  relax(c)
+                  c.requestMethod = method; c.connectTimeout = 4000; c.readTimeout = 6000; c.instanceFollowRedirects = false
+                  if (cookies.isNotEmpty()) c.setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                  if (auth != null) c.setRequestProperty("Authorization", auth)
+                  if (ctype != null) c.setRequestProperty("Content-Type", ctype)
+                  if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body) } }
+                  val code = c.responseCode
+                  c.headerFields["Set-Cookie"]?.forEach { sc -> val kv = sc.substringBefore(";"); if (kv.contains("=")) cookies[kv.substringBefore("=").trim()] = kv.substringAfter("=").trim() }
+                  val txt = (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                  return code to txt
+              }
+
+              @Synchronized fun read(): DevData {
+                  val ip = cfg.ip
+                  val https = open(ip, 443); val plain = open(ip, 80)
+                  if (!https && !plain) return DevData(false, cfg.type == "ubiquiti" || cfg.type == "mikrotik")
+                  if (cfg.type == "other") return DevData(true, false, "غير متاح: قراءة الإشارة تتطلب بيانات دخول الصحن (إعدادات الجهاز)؛ يُفحص وصول الجهاز فقط")
+                  val base = (if (https) "https://" else "http://") + ip
+                  return try { if (cfg.type == "ubiquiti") ubnt(base) else mt(base) } catch (e: Exception) { DevData(true, true, "تعذّرت القراءة: ${e.message}") }
+              }
+
+              private fun ubnt(b: String): DevData {
+                  cookies.clear()
+                  http("$b/login.cgi")
+                  val bd = "----netcheck"
+                  fun part(n: String, v: String) = "--$bd\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n"
+                  val form = part("username", cfg.user) + part("password", cfg.pass) + part("uri", "/status.cgi") + "--$bd--\r\n"
+                  http("$b/login.cgi", "POST", form.toByteArray(), "multipart/form-data; boundary=$bd")
+                  var txt = http("$b/status.cgi").second
+                  if (!txt.trimStart().startsWith("{")) { // airOS الأحدث
+                      http("$b/api/auth", "POST", JSONObject().put("username", cfg.user).put("password", cfg.pass).toString().toByteArray(), "application/json")
+                      txt = http("$b/status.cgi").second
+                  }
+                  if (!txt.trimStart().startsWith("{")) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور ونوع الجهاز")
+                  val j = JSONObject(txt); val w = j.optJSONObject("wireless"); val h = j.optJSONObject("host")
+                  val sig = w?.optInt("signal", 0)?.takeIf { it != 0 }
+                  val noise = w?.optInt("noisef", 0)?.takeIf { it != 0 }
+                  val tx = w?.optInt("txpower", 0)?.takeIf { it != 0 }
+                  val linked: Boolean? = if (w != null && w.optString("opmode") == "sta") sig != null else null
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val arr = j.optJSONArray("interfaces")
+                  if (arr != null) for (i in 0 until arr.length()) {
+                      val o = arr.optJSONObject(i) ?: continue
+                      val st = o.optJSONObject("status")
+                      if (o.optString("ifname") == "eth0" && st != null) { ethUp = st.optInt("plugged", 0) == 1; spd = st.optInt("speed", 0).takeIf { it > 0 } }
+                  }
+                  val up = h?.optLong("uptime", -1)?.takeIf { it >= 0 }
+                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null, tx)
+              }
+
+              private fun mt(b: String): DevData {
+                  val auth = "Basic " + Base64.encodeToString("${cfg.user}:${cfg.pass}".toByteArray(), Base64.NO_WRAP)
+                  fun get(path: String) = http("$b/rest/$path", auth = auth)
+                  val probe = get("system/resource")
+                  if (probe.first == 401) return DevData(true, true, "فشل تسجيل الدخول: تحقق من المستخدم وكلمة المرور")
+                  if (probe.first != 200) return DevData(true, true, "REST API غير متاح (يتطلب RouterOS 7.1+ مع تفعيل خدمة www)")
+                  var reg = get("interface/wifi/registration-table")
+                  if (reg.first != 200) reg = get("interface/wireless/registration-table")
+                  var linked: Boolean? = null; var sig: Int? = null; var snr: Int? = null; var noise: Int? = null
+                  if (reg.first == 200) {
+                      val a = JSONArray(reg.second); linked = a.length() > 0
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0)
+                          sig = num(o.optString("signal").ifEmpty { o.optString("signal-strength") })
+                          snr = num(o.optString("signal-to-noise")); noise = num(o.optString("noise-floor"))
+                          if (snr == null && sig != null && noise != null) snr = sig - noise
+                          if (noise == null && sig != null && snr != null) noise = sig - snr
+                      }
+                  }
+                  var ethUp: Boolean? = null; var spd: Int? = null
+                  val eth = get("interface/ethernet")
+                  if (eth.first == 200) {
+                      val a = JSONArray(eth.second)
+                      if (a.length() > 0) {
+                          val o = a.getJSONObject(0); ethUp = o.optString("running") == "true"
+                          val rate = o.optString("rate")
+                          spd = when { rate.contains("10Gbps") -> 10000; rate.contains("2.5Gbps") -> 2500; rate.contains("1Gbps") -> 1000; rate.contains("100Mbps") -> 100; rate.contains("10Mbps") -> 10; else -> null }
+                      }
+                  }
+                  var v: Double? = null
+                  val hl = get("system/health")
+                  if (hl.first == 200) {
+                      val t = hl.second.trim()
+                      if (t.startsWith("[")) { val a = JSONArray(t); for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("name") == "voltage") v = o.optString("value").toDoubleOrNull() } }
+                      else v = JSONObject(t).optString("voltage").toDoubleOrNull()
+                  }
+                  var tx: Int? = null
+                  try {
+                      val wl = get("interface/wireless")
+                      if (wl.first == 200) { val a = JSONArray(wl.second); if (a.length() > 0) tx = num(a.getJSONObject(0).optString("tx-power"))?.takeIf { it in 1..40 } }
+                  } catch (e: Exception) { }
+                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v, tx)
+              }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/UiViews.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/UiViews.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.view.View
+
+          /** رسم بياني لحركة الإشارة خلال الوقت (آخر 60 قراءة حقيقية من الجهاز، المدى -90 إلى -40 dBm) */
+          class GraphView(c: Context) : View(c) {
+              private val d = c.resources.displayMetrics.density
+              private val values = ArrayList<Int>()
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f * d; color = Color.parseColor("#34D399"); strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND }
+              private val grid = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = d; color = Color.parseColor("#3A4C70"); pathEffect = DashPathEffect(floatArrayOf(6f * d, 6f * d), 0f) }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#8FA3C7"); textSize = 12f * d; textAlign = Paint.Align.CENTER }
+              private val path = Path()
+
+              fun add(v: Int) {
+                  values.add(v); while (values.size > 60) values.removeAt(0)
+                  line.color = when { v >= -70 -> Color.parseColor("#34D399"); v >= -80 -> Color.parseColor("#FACC15"); else -> Color.parseColor("#F87171") }
+                  invalidate()
+              }
+
+              override fun onMeasure(wSpec: Int, hSpec: Int) {
+                  setMeasuredDimension(View.MeasureSpec.getSize(wSpec), (150 * d).toInt())
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat(); val m = 12f * d
+                  for (i in 0..2) { val y = m + (h - 2 * m) * i / 2f; path.reset(); path.moveTo(m, y); path.lineTo(w - m, y); canvas.drawPath(path, grid) }
+                  val n = values.size
+                  if (n < 2) { canvas.drawText("لا توجد قراءات بعد: اقرأ إشارة الصحن وشغّل المراقبة", w / 2, h / 2, txt); return }
+                  path.reset()
+                  for (i in 0 until n) {
+                      val frac = ((values[i] + 90) / 50f).coerceIn(0f, 1f)
+                      val x = m + (w - 2 * m) * i / (n - 1)
+                      val y = h - m - frac * (h - 2 * m)
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  canvas.drawPath(path, line)
+              }
+          }
+          NETCHECK_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetCheck-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
