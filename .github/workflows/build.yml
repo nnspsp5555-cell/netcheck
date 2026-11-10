@@ -73,8 +73,10 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
+          import android.content.res.ColorStateList
           import android.graphics.Color
           import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
           import android.net.wifi.WifiManager
           import android.os.Bundle
           import android.text.InputType
@@ -103,6 +105,14 @@ jobs:
               private lateinit var summary: LinearLayout
               private lateinit var verdict: TextView
               private lateinit var monitorView: TextView
+              private lateinit var gauge: GaugeView
+              private lateinit var graph: GraphView
+              private lateinit var txVal: TextView
+              private lateinit var txBar: ProgressBar
+              private lateinit var snrVal: TextView
+              private lateinit var noiseVal: TextView
+              private lateinit var linkVal: TextView
+              private lateinit var statusBadge: TextView
               private lateinit var cfg: DevConfig
               private var reader: DeviceReader? = null
               @Volatile private var checking = false
@@ -115,12 +125,44 @@ jobs:
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   cfg = DevConfig.load(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
-                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40); setBackgroundColor(Color.parseColor("#0B1220")); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+                  val sv = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#0B1220")); addView(root) }
+                  val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+                  val match = LinearLayout.LayoutParams.MATCH_PARENT
                   root.addView(tv("NET CHECK", 28f, Color.WHITE, true))
-                  btn = Button(this).apply { text = "ابدأ الفحص"; textSize = 20f; setOnClickListener { runCheck() } }
-                  root.addView(btn)
+
+                  // ---- لوحة إشارة الصحن ----
+                  statusBadge = tv("غير متاح", 18f, Color.GRAY, true).apply { gravity = Gravity.CENTER }
+                  root.addView(statusBadge, LinearLayout.LayoutParams(wrap, wrap).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = px(8) })
+                  gauge = GaugeView(this)
+                  root.addView(gauge, LinearLayout.LayoutParams(wrap, wrap).apply { gravity = Gravity.CENTER_HORIZONTAL })
+
+                  txVal = tv("غير متاح", 20f, Color.WHITE, true)
+                  txBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+                  root.addView(card().apply { addView(tv("قوة الإرسال TX", 13f, Color.GRAY)); addView(txVal); addView(txBar, LinearLayout.LayoutParams(match, wrap)) }, lp(match, wrap, top = 8))
+
+                  snrVal = tv("غير متاح", 20f, Color.WHITE, true)
+                  noiseVal = tv("غير متاح", 20f, Color.WHITE, true)
+                  root.addView(LinearLayout(this).apply {
+                      addView(tile("SNR جودة الإشارة", snrVal), lp(0, wrap, 1f, side = 4))
+                      addView(tile("Noise التشويش", noiseVal), lp(0, wrap, 1f, side = 4))
+                  }, lp(match, wrap, top = 8))
+
+                  linkVal = tv("غير متاح", 20f, Color.GRAY, true)
+                  root.addView(tile("حالة الاتصال بين الصحن والبرج", linkVal), lp(match, wrap, top = 8))
+
+                  graph = GraphView(this)
+                  root.addView(card().apply { addView(tv("حركة الإشارة خلال الوقت", 13f, Color.GRAY)); addView(graph, LinearLayout.LayoutParams(match, wrap)) }, lp(match, wrap, top = 8))
+
+                  // ---- الأزرار ----
+                  btn = Button(this).apply {
+                      text = "ابدأ الفحص"; textSize = 22f; setTextColor(Color.WHITE)
+                      background = GradientDrawable().apply { setColor(Color.parseColor("#2563EB")); cornerRadius = px(32).toFloat() }
+                      setOnClickListener { runCheck() }
+                  }
+                  root.addView(btn, lp(match, px(68), top = 16))
                   monBtn = Button(this).apply { text = "مراقبة الاستقرار"; textSize = 16f; setOnClickListener { toggleMonitor() } }
-                  root.addView(monBtn)
+                  root.addView(monBtn, lp(match, wrap, top = 8))
                   root.addView(LinearLayout(this).apply {
                       addView(small("إعدادات الجهاز") { settings() }); addView(small("السجل") { showHistory() }); addView(small("مشاركة التقرير") { share() })
                   })
@@ -131,14 +173,54 @@ jobs:
                   monitorView = tv("", 15f, Color.CYAN)
                   root.addView(monitorView)
                   out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                  root.addView(ScrollView(this).apply { addView(out) })
-                  setContentView(root)
+                  root.addView(out)
+                  setContentView(sv)
               }
 
               // توفير البطارية: تتوقف المراقبة عند خروج التطبيق من الشاشة
               override fun onStop() { if (monitoring) { monitoring = false; monBtn.text = "مراقبة الاستقرار" }; super.onStop() }
 
               override fun onDestroy() { monitoring = false; super.onDestroy() }
+
+              private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun card(): LinearLayout = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; setPadding(px(14), px(12), px(14), px(12))
+                  background = GradientDrawable().apply { setColor(Color.parseColor("#111A2E")); cornerRadius = px(16).toFloat() }
+              }
+              private fun tile(title: String, v: TextView): LinearLayout = card().apply { addView(tv(title, 13f, Color.GRAY)); addView(v) }
+              private fun lp(w: Int, h: Int, weight: Float = 0f, top: Int = 0, side: Int = 0) =
+                  LinearLayout.LayoutParams(w, h, weight).apply { setMargins(px(side), px(top), px(side), 0) }
+
+              /** تحديث لوحة الصحن: كل قيمة تُعرض فقط إذا وفّرها الجهاز، وإلا "غير متاح" */
+              private fun updateDash(d: DevData?) {
+                  val sig = d?.signal
+                  val dead = d != null && (!d.reachable || d.linked == false)
+                  val (st, sc) = when {
+                      d == null -> "غير متاح" to Color.GRAY
+                      dead -> "منقطع" to Color.RED
+                      sig == null -> "غير متاح" to Color.GRAY
+                      sig >= -60 -> "ممتاز" to Color.GREEN
+                      sig >= -70 -> "جيد" to Color.parseColor("#84CC16")
+                      sig >= -80 -> "ضعيف" to Color.YELLOW
+                      else -> "ضعيف" to Color.RED
+                  }
+                  statusBadge.text = st; statusBadge.setTextColor(sc)
+                  gauge.value = if (dead) null else sig
+                  txVal.text = d?.txPower?.let { "$it dBm" } ?: "غير متاح"
+                  txBar.progress = (d?.txPower ?: 0).coerceIn(0, 30) * 100 / 30
+                  txBar.progressTintList = ColorStateList.valueOf(Color.parseColor("#38BDF8"))
+                  snrVal.text = d?.snr?.let { "$it dB" } ?: "غير متاح"
+                  noiseVal.text = d?.noise?.let { "$it dBm" } ?: "غير متاح"
+                  val (lt, lc) = when {
+                      d == null -> "غير متاح" to Color.GRAY
+                      !d.reachable -> "الصحن لا يستجيب" to Color.RED
+                      d.linked == true -> "مرتبط بالبرج" to Color.GREEN
+                      d.linked == false -> "منقطع عن البرج" to Color.RED
+                      else -> "غير متاح: الجهاز لا يوفّر الحالة" to Color.GRAY
+                  }
+                  linkVal.text = lt; linkVal.setTextColor(lc)
+                  if (sig != null && !dead) graph.add(sig)
+              }
 
               private fun tv(t: String, size: Float, c: Int, bold: Boolean = false) = TextView(this).apply {
                   text = t; textSize = size; setTextColor(c); gravity = Gravity.START
@@ -305,6 +387,7 @@ jobs:
                       }
                       lastReport = rep; saveHistory(rep)
                       runOnUiThread {
+                          updateDash(d)
                           summary.removeAllViews()
                           sumRow("الإنترنت: " + (if (netUp) "يعمل" else "منقطع"), colorOf(netUp, false))
                           sumRow("الراوتر: " + (if (routerOk) "متصل ($gwIp)" else "غير متصل"), colorOf(routerOk, false))
@@ -336,9 +419,11 @@ jobs:
                       while (monitoring && gen == monGen) {
                           val p = ping("1.1.1.1", 1)
                           if (p.loss < 100) { ok++; streak = 0 } else { fail++; streak++ }
-                          var sigTxt = ""
+                          var sigTxt = ""; var devNow: DevData? = null
                           if (cfg.enabled) {
-                              val sig = try { (reader ?: DeviceReader(cfg).also { reader = it }).read().signal } catch (e: Exception) { null }
+                              val dd = try { (reader ?: DeviceReader(cfg).also { reader = it }).read() } catch (e: Exception) { null }
+                              devNow = dd
+                              val sig = dd?.signal
                               if (sig != null) {
                                   sigTxt = "، الإشارة $sig dBm"
                                   val pv = prev; val mx = max
@@ -349,8 +434,10 @@ jobs:
                           }
                           val total = ok + fail
                           val note = dropNote
+                          val dv = devNow
                           runOnUiThread {
                               monitorView.text = "المراقبة: نجح $ok، فشل $fail، استقرار ${ok * 100 / total}%" + (p.avgMs?.let { "، الآن %.0f ms".format(it) } ?: "، انقطاع") + sigTxt + (if (note != null) "\n⚠ $note" else "")
+                              if (dv != null) updateDash(dv)
                           }
                           if (streak >= 3 && !checking) { streak = 0; runOnUiThread { runCheck() } }
                           try { Thread.sleep(3000) } catch (e: InterruptedException) { }
@@ -421,7 +508,8 @@ jobs:
           data class DevData(
               val reachable: Boolean, val supported: Boolean, val error: String? = null,
               val linked: Boolean? = null, val signal: Int? = null, val noise: Int? = null, val snr: Int? = null,
-              val ethUp: Boolean? = null, val ethSpeed: Int? = null, val uptimeSec: Long? = null, val voltage: Double? = null)
+              val ethUp: Boolean? = null, val ethSpeed: Int? = null, val uptimeSec: Long? = null, val voltage: Double? = null,
+              val txPower: Int? = null)
 
           /** تشفير كلمة مرور الجهاز بمفتاح AES داخل Android Keystore (لا يخرج من الهاتف) */
           object Vault {
@@ -503,6 +591,7 @@ jobs:
                   val j = JSONObject(txt); val w = j.optJSONObject("wireless"); val h = j.optJSONObject("host")
                   val sig = w?.optInt("signal", 0)?.takeIf { it != 0 }
                   val noise = w?.optInt("noisef", 0)?.takeIf { it != 0 }
+                  val tx = w?.optInt("txpower", 0)?.takeIf { it != 0 }
                   val linked: Boolean? = if (w != null && w.optString("opmode") == "sta") sig != null else null
                   var ethUp: Boolean? = null; var spd: Int? = null
                   val arr = j.optJSONArray("interfaces")
@@ -512,7 +601,7 @@ jobs:
                       if (o.optString("ifname") == "eth0" && st != null) { ethUp = st.optInt("plugged", 0) == 1; spd = st.optInt("speed", 0).takeIf { it > 0 } }
                   }
                   val up = h?.optLong("uptime", -1)?.takeIf { it >= 0 }
-                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null)
+                  return DevData(true, true, null, linked, sig, noise, if (sig != null && noise != null) sig - noise else null, ethUp, spd, up, null, tx)
               }
 
               private fun mt(b: String): DevData {
@@ -551,7 +640,91 @@ jobs:
                       if (t.startsWith("[")) { val a = JSONArray(t); for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("name") == "voltage") v = o.optString("value").toDoubleOrNull() } }
                       else v = JSONObject(t).optString("voltage").toDoubleOrNull()
                   }
-                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v)
+                  var tx: Int? = null
+                  try {
+                      val wl = get("interface/wireless")
+                      if (wl.first == 200) { val a = JSONArray(wl.second); if (a.length() > 0) tx = num(a.getJSONObject(0).optString("tx-power"))?.takeIf { it in 1..40 } }
+                  } catch (e: Exception) { }
+                  return DevData(true, true, null, linked, sig, noise, snr, ethUp, spd, null, v, tx)
+              }
+          }
+          NETCHECK_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/netcheck/UiViews.kt')"
+          cat > 'app/src/main/java/com/example/netcheck/UiViews.kt' <<'NETCHECK_EOF'
+          package com.example.netcheck
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.view.View
+
+          /** مؤشر دائري كبير لقوة استقبال الصحن RX بوحدة dBm (المدى من -90 إلى -40) */
+          class GaugeView(c: Context) : View(c) {
+              private val d = c.resources.displayMetrics.density
+              var value: Int? = null
+                  set(v) { field = v; invalidate() }
+              private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 16f * d; color = Color.parseColor("#1E293B"); strokeCap = Paint.Cap.ROUND }
+              private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 16f * d; strokeCap = Paint.Cap.ROUND }
+              private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 52f * d; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
+              private val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GRAY; textSize = 16f * d; textAlign = Paint.Align.CENTER }
+              private val rect = RectF()
+
+              override fun onMeasure(wSpec: Int, hSpec: Int) {
+                  val s = minOf(View.MeasureSpec.getSize(wSpec), (300 * d).toInt())
+                  setMeasuredDimension(s, (s * 0.82f).toInt())
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat()
+                  val pad = 14f * d
+                  rect.set(pad, pad, w - pad, w - pad)
+                  canvas.drawArc(rect, 150f, 240f, false, track)
+                  val v = value
+                  if (v != null) {
+                      val frac = ((v + 90) / 50f).coerceIn(0f, 1f)
+                      arc.color = when { v >= -70 -> Color.GREEN; v >= -80 -> Color.YELLOW; else -> Color.RED }
+                      canvas.drawArc(rect, 150f, 240f * frac, false, arc)
+                  }
+                  canvas.drawText("RX", w / 2, w / 2 - 28f * d, small)
+                  canvas.drawText(v?.toString() ?: "--", w / 2, w / 2 + 14f * d, big)
+                  canvas.drawText("dBm", w / 2, w / 2 + 38f * d, small)
+              }
+          }
+
+          /** رسم بياني لحركة الإشارة خلال الوقت (آخر 60 قراءة حقيقية من الجهاز) */
+          class GraphView(c: Context) : View(c) {
+              private val d = c.resources.displayMetrics.density
+              private val data = ArrayList<Int>()
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.5f * d; color = Color.CYAN; strokeJoin = Paint.Join.ROUND }
+              private val grid = Paint().apply { color = Color.parseColor("#1E293B"); strokeWidth = d }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GRAY; textSize = 11f * d }
+              private val path = Path()
+
+              fun add(v: Int) { data.add(v); while (data.size > 60) data.removeAt(0); invalidate() }
+
+              override fun onMeasure(wSpec: Int, hSpec: Int) {
+                  setMeasuredDimension(View.MeasureSpec.getSize(wSpec), (140 * d).toInt())
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat(); val m = 10f * d
+                  for (i in 0..4) { val y = m + (h - 2 * m) * i / 4f; canvas.drawLine(m, y, w - m, y, grid) }
+                  canvas.drawText("-40", m + 2f * d, m + 12f * d, txt)
+                  canvas.drawText("-90", m + 2f * d, h - m - 3f * d, txt)
+                  val n = data.size
+                  if (n < 2) { canvas.drawText("شغّل المراقبة أو كرر الفحص لرسم حركة الإشارة", m * 3, h / 2, txt); return }
+                  path.reset()
+                  for (i in 0 until n) {
+                      val frac = ((data[i] + 90) / 50f).coerceIn(0f, 1f)
+                      val x = m + (w - 2 * m) * i / (n - 1)
+                      val y = h - m - frac * (h - 2 * m)
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  canvas.drawPath(path, line)
               }
           }
           NETCHECK_EOF
