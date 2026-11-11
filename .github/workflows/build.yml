@@ -43,7 +43,7 @@ jobs:
           android {
               namespace = "com.example.netcheck"
               compileSdk = 34
-              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 2; versionName = "2.0" }
+              defaultConfig { applicationId = "com.example.netcheck"; minSdk = 24; targetSdk = 34; versionCode = 3; versionName = "2.1" }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
           }
@@ -55,6 +55,9 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"/>
               <application android:label="NET CHECK" android:allowBackup="false" android:supportsRtl="true"
                   android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
@@ -70,14 +73,23 @@ jobs:
           cat > 'app/src/main/java/com/example/netcheck/MainActivity.kt' <<'NETCHECK_EOF'
           package com.example.netcheck
 
+          import android.Manifest
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.location.LocationManager
           import android.graphics.Color
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.net.wifi.ScanResult
+          import android.net.wifi.WifiConfiguration
           import android.net.wifi.WifiManager
+          import android.net.wifi.WifiNetworkSuggestion
+          import android.os.Build
           import android.os.Bundle
+          import android.os.SystemClock
+          import android.provider.Settings
           import android.text.InputType
           import android.view.Gravity
           import android.view.View
@@ -136,6 +148,12 @@ jobs:
               private lateinit var etIp: EditText
               private lateinit var etUser: EditText
               private lateinit var etPass: EditText
+              private lateinit var wifiSummary: TextView
+              private lateinit var wifiList: LinearLayout
+              private lateinit var etSsid: EditText
+              private lateinit var etWpass: EditText
+              private lateinit var spSec: Spinner
+              private lateinit var cbHidden: CheckBox
               private lateinit var cfg: DevConfig
               private var reader: DeviceReader? = null
               @Volatile private var checking = false
@@ -148,9 +166,9 @@ jobs:
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   cfg = DevConfig.load(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
-                  val home = buildHome(); val hist = buildHistory(); val set = buildSettings()
-                  val holder = FrameLayout(this).apply { addView(home); addView(hist); addView(set) }
-                  pages = listOf(home, hist, set)
+                  val home = buildHome(); val hist = buildHistory(); val set = buildSettings(); val wifi = buildWifi()
+                  val holder = FrameLayout(this).apply { addView(home); addView(hist); addView(set); addView(wifi) }
+                  pages = listOf(home, hist, set, wifi)
                   tabs = listOf("الرئيسية", "السجل", "الإعدادات").mapIndexed { i, n ->
                       tv(n, 15f, cMuted).apply { gravity = Gravity.CENTER; setPadding(0, px(16), 0, px(16)); setOnClickListener { select(i) } }
                   }
@@ -251,6 +269,7 @@ jobs:
                   findBtn = outline("بحث عن الصحن") { findDish() }
                   monBtn = outline("مراقبة الاستقرار") { toggleMonitor() }
                   col.addView(LinearLayout(this).apply { addView(findBtn, lp(0, px(52), 1f, side = 5)); addView(monBtn, lp(0, px(52), 1f, side = 5)) }, lp(MATCH, WRAP, top = 10))
+                  col.addView(outline("البحث عن الشبكات المخفية") { openWifi() }, lp(MATCH, px(52), top = 8))
                   monitorView = tv("", 14f, Color.CYAN)
                   col.addView(monitorView, lp(MATCH, WRAP, top = 8))
 
@@ -342,7 +361,7 @@ jobs:
                   col.addView(outline("بحث عن الصحن") { findDish() }, lp(MATCH, px(52), top = 10))
                   col.addView(outline("إعادة البحث التلقائي") { getSharedPreferences("auto", 0).edit().clear().apply(); toast("تم مسح العنوان المحفوظ") }, lp(MATCH, px(52), top = 8))
                   col.addView(tv("كلمة مرور الجهاز تُحفظ مشفّرة على هاتفك فقط.", 12f, cMuted), lp(MATCH, WRAP, top = 12))
-                  col.addView(tv("الإصدار 2.0 (الواجهة الجديدة)", 12f, cMuted), lp(MATCH, WRAP, top = 6))
+                  col.addView(tv("الإصدار 2.1 (الشبكات المخفية)", 12f, cMuted), lp(MATCH, WRAP, top = 6))
                   return ScrollView(this).apply { addView(col) }
               }
               private fun fillSettings() { spType.setSelection(types.indexOf(cfg.type).coerceAtLeast(0)); etIp.setText(cfg.ip); etUser.setText(cfg.user); etPass.setText(cfg.pass) }
@@ -350,6 +369,145 @@ jobs:
                   cfg = DevConfig(types[spType.selectedItemPosition], etIp.text.toString().trim(), etUser.text.toString().trim(), etPass.text.toString())
                   cfg.save(this); reader = if (cfg.enabled) DeviceReader(cfg) else null
                   toast("تم الحفظ")
+              }
+
+              // ---------- الشبكات القريبة والمخفية ----------
+              private fun primary(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; textSize = 18f; isAllCaps = false; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE)
+                  background = bg(cOrange, 24); setOnClickListener { f() }
+              }
+
+              private fun buildWifi(): ScrollView {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(20)) }
+                  val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(tv("الشبكات القريبة", 28f, Color.WHITE, true), lp(0, WRAP, 1f))
+                  top.addView(outline("رجوع") { select(0) }, lp(px(90), px(44)))
+                  col.addView(top)
+                  col.addView(card().apply {
+                      addView(tv("لماذا يطلب أندرويد صلاحية الموقع؟", 16f, Color.WHITE, true))
+                      addView(tv("يشترط أندرويد صلاحية «الموقع» (و«الأجهزة القريبة» في أندرويد 13 فما فوق) وتشغيل خدمة الموقع وWi-Fi حتى يسمح لأي تطبيق بقراءة قائمة الشبكات القريبة. يستخدمها NET CHECK لعرض الشبكات فقط، ولا يحفظ موقعك ولا يرسله لأي جهة.", 13f, cText).apply { setPadding(0, px(6), 0, 0) })
+                      addView(tv("أندرويد لا يكشف اسم الشبكة المخفية لأي تطبيق: تظهر هنا بعنوانها (BSSID) وإشارتها وترددها وقناتها فقط. إذا كنت تعرف اسمها، أدخله في قسم الاتصال اليدوي أدناه.", 13f, cYellow).apply { setPadding(0, px(8), 0, 0) })
+                  }, lp(MATCH, WRAP, top = 12))
+                  col.addView(primary("البحث عن الشبكات المخفية") { scanWifi() }, lp(MATCH, px(60), top = 12))
+                  wifiSummary = tv("", 14f, cYellow).apply { setPadding(0, px(10), 0, 0) }
+                  col.addView(wifiSummary)
+                  wifiList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(wifiList)
+
+                  spSec = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, arrayOf("WPA2 (كلمة مرور)", "WPA3 (كلمة مرور)", "مفتوحة (بدون كلمة مرور)")) }
+                  etSsid = edit("اسم الشبكة (SSID)"); etWpass = edit("كلمة مرور الشبكة", true)
+                  cbHidden = CheckBox(this).apply { text = "شبكة مخفية (الاسم غير معلن)"; setTextColor(Color.WHITE) }
+                  col.addView(card().apply {
+                      addView(tv("الاتصال بشبكة يدوياً", 18f, Color.WHITE, true))
+                      addView(field("اسم الشبكة", etSsid), lp(MATCH, WRAP, top = 10)); addView(field("نوع الحماية", spSec), lp(MATCH, WRAP, top = 10))
+                      addView(field("كلمة المرور", etWpass), lp(MATCH, WRAP, top = 10)); addView(cbHidden, lp(MATCH, WRAP, top = 8))
+                  }, lp(MATCH, WRAP, top = 16))
+                  col.addView(primary("اتصال") { connectManual() }, lp(MATCH, px(58), top = 12))
+                  return ScrollView(this).apply { addView(col) }
+              }
+
+              private fun openWifi() { select(3); scanWifi() }
+
+              private fun locationOn(): Boolean {
+                  val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+                  return if (Build.VERSION.SDK_INT >= 28) lm.isLocationEnabled else (lm.isProviderEnabled(LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER))
+              }
+
+              private fun scanWifi() {
+                  val need = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                  if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.NEARBY_WIFI_DEVICES
+                  val missing = need.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isNotEmpty()) {
+                      AlertDialog.Builder(this).setTitle("صلاحية مطلوبة")
+                          .setMessage("لعرض الشبكات القريبة يشترط أندرويد صلاحية الموقع (والأجهزة القريبة في أندرويد 13+). لا يحفظ التطبيق موقعك ولا يرسله.")
+                          .setPositiveButton("متابعة") { _, _ -> requestPermissions(missing.toTypedArray(), 77) }.setNegativeButton("إلغاء", null).show()
+                      return
+                  }
+                  doScan()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode != 77) return
+                  val fine = permissions.indices.any { permissions[it] == Manifest.permission.ACCESS_FINE_LOCATION && grantResults[it] == PackageManager.PERMISSION_GRANTED }
+                  if (fine) doScan() else toast("بدون صلاحية الموقع لا يسمح أندرويد بعرض الشبكات القريبة")
+              }
+
+              private fun doScan() {
+                  val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  if (!wm.isWifiEnabled) { toast("فعّل Wi-Fi أولاً"); return }
+                  wifiSummary.text = "جاري البحث عن الشبكات..."; wifiList.removeAllViews()
+                  thread {
+                      val t0 = SystemClock.elapsedRealtime() * 1000
+                      @Suppress("DEPRECATION") val started = try { wm.startScan() } catch (e: SecurityException) { false }
+                      var res: List<ScanResult> = emptyList(); var fresh = false
+                      for (i in 1..12) {
+                          try { Thread.sleep(700) } catch (e: InterruptedException) { }
+                          res = try { wm.scanResults } catch (e: SecurityException) { emptyList() }
+                          if (started && res.any { it.timestamp >= t0 }) { fresh = true; break }
+                          if (!started && i >= 2) break
+                      }
+                      runOnUiThread { showNetworks(res, fresh) }
+                  }
+              }
+
+              private fun nameOf(r: ScanResult): String = (r.SSID ?: "").replace("\u0000", "").trim()
+              private fun bandOf(f: Int) = if (f < 3000) "2.4 GHz" else if (f < 5900) "5 GHz" else "6 GHz"
+              private fun chanOf(f: Int) = when { f == 2484 -> 14; f in 2400..2483 -> (f - 2407) / 5; f in 5000..5899 -> (f - 5000) / 5; f >= 5900 -> (f - 5950) / 5; else -> 0 }
+              private fun sigWord(l: Int) = if (l >= -60) "قوية" else if (l >= -70) "جيدة" else if (l >= -80) "ضعيفة" else "ضعيفة جداً"
+              private fun secOf(c: String?): String {
+                  val x = c ?: ""
+                  return when { x.contains("SAE") || x.contains("WPA3") -> "WPA3"; x.contains("WPA2") -> "WPA2"; x.contains("WPA") -> "WPA"; x.contains("WEP") -> "WEP"; else -> "مفتوحة" }
+              }
+
+              private fun showNetworks(res: List<ScanResult>, fresh: Boolean) {
+                  wifiList.removeAllViews()
+                  if (res.isEmpty()) {
+                      val locOff = !locationOn()
+                      wifiSummary.text = "لم يُعثر على شبكات."
+                      wifiList.addView(tv(if (locOff) "خدمة الموقع مغلقة: شغّلها من إعدادات الهاتف ثم أعد البحث، فأندرويد لا يعرض الشبكات بدونها." else "لم يرجع النظام أي نتائج. تأكد من تشغيل Wi-Fi ومنح الصلاحيات ثم أعد البحث.", 14f, cRed))
+                      if (locOff) wifiList.addView(outline("فتح إعدادات الموقع") { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }, lp(MATCH, px(48), top = 8))
+                      return
+                  }
+                  val hidden = res.count { nameOf(it).isEmpty() }
+                  wifiSummary.text = "عدد النقاط: ${res.size} · المخفية: $hidden" + (if (!fresh) "\nعُرضت آخر نتائج مخزنة في النظام (يقيّد أندرويد عدد مرات الفحص)." else "")
+                  for (r in res.sortedWith(compareByDescending<ScanResult> { nameOf(it).isEmpty() }.thenByDescending { it.level })) {
+                      val n = nameOf(r); val hid = n.isEmpty()
+                      wifiList.addView(card().apply {
+                          addView(tv(if (hid) "شبكة مخفية" else n, 17f, if (hid) cYellow else Color.WHITE, true))
+                          addView(tv("BSSID: ${r.BSSID}", 13f, cText))
+                          addView(tv("الإشارة: ${r.level} dBm (${sigWord(r.level)}) · التردد: ${r.frequency} MHz (${bandOf(r.frequency)}) · القناة: ${chanOf(r.frequency)}", 13f, cText))
+                          addView(tv("الحماية: ${secOf(r.capabilities)}", 13f, cMuted))
+                      }, lp(MATCH, WRAP, top = 8))
+                  }
+              }
+
+              private fun connectManual() {
+                  val ssid = etSsid.text.toString().trim(); val pass = etWpass.text.toString()
+                  if (ssid.isEmpty()) { toast("اكتب اسم الشبكة"); return }
+                  val sec = spSec.selectedItemPosition // 0 WPA2 · 1 WPA3 · 2 مفتوحة
+                  if (sec != 2 && pass.length < 8) { toast("كلمة مرور الشبكة يجب ألا تقل عن 8 أحرف"); return }
+                  val hidden = cbHidden.isChecked
+                  val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                  if (!wm.isWifiEnabled) { toast("فعّل Wi-Fi أولاً"); return }
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          val b = WifiNetworkSuggestion.Builder().setSsid(ssid).setIsHiddenSsid(hidden)
+                          if (sec == 0) b.setWpa2Passphrase(pass) else if (sec == 1) b.setWpa3Passphrase(pass)
+                          val st = wm.addNetworkSuggestions(listOf(b.build()))
+                          if (st == WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS || st == WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_ADD_DUPLICATE)
+                              toast("أُرسل طلب الاتصال بـ $ssid. وافق على إشعار النظام إن ظهر؛ ويتصل الهاتف عندما تكون الشبكة في النطاق وكلمة المرور صحيحة.")
+                          else toast("رفض النظام الطلب (الرمز $st)")
+                      } else {
+                          @Suppress("DEPRECATION") val c = WifiConfiguration().apply {
+                              SSID = "\"$ssid\""; hiddenSSID = hidden
+                              if (sec == 2) allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE) else preSharedKey = "\"$pass\""
+                          }
+                          @Suppress("DEPRECATION") val id = wm.addNetwork(c)
+                          if (id == -1) toast("رفض النظام إضافة الشبكة")
+                          else { wm.disconnect(); wm.enableNetwork(id, true); wm.reconnect(); toast("جاري الاتصال بـ $ssid") }
+                      }
+                  } catch (e: Exception) { toast("تعذّر الاتصال: ${e.message}") }
               }
 
               // ---------- زر: بحث عن الصحن ----------
